@@ -25,8 +25,6 @@ from transformers import (
     AutoProcessor,
     AutoTokenizer,
 )
-from trl import AutoModelForCausalLMWithValueHead
-
 from ..extras import logging
 from ..extras.misc import count_parameters, skip_check_imports, try_download_model_from_other_hub
 from ..extras.packages import is_torch_version_greater_than
@@ -188,6 +186,8 @@ def load_model(
     model = init_adapter(config, model, model_args, finetuning_args, is_trainable)
 
     if add_valuehead:
+        from trl import AutoModelForCausalLMWithValueHead
+
         model = AutoModelForCausalLMWithValueHead.from_pretrained(model)
         patch_valuehead_model(model)
 

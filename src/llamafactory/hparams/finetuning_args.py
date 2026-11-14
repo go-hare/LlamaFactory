@@ -457,7 +457,7 @@ class FinetuningArguments(
         default=False,
         metadata={"help": "Whether or not to train model in purely bf16 precision (without AMP)."},
     )
-    stage: Literal["pt", "sft", "rm", "ppo", "dpo", "kto"] = field(
+    stage: Literal["pt", "sft", "rm", "ppo", "dpo", "kto", "diffusion"] = field(
         default="sft",
         metadata={"help": "Which stage will be performed in training."},
     )
@@ -589,6 +589,18 @@ class FinetuningArguments(
     early_stopping_steps: int | None = field(
         default=None,
         metadata={"help": "Number of steps to stop training if the `metric_for_best_model` does not improve."},
+    )
+    rl_steps: int = field(
+        default=0,
+        metadata={"help": "Diffusion SD-RL steps after SFT. 0 keeps SFT only."},
+    )
+    rl_teacher_steps: int = field(
+        default=8,
+        metadata={"help": "Max denoising steps for the online teacher trajectory."},
+    )
+    rl_student_steps: int = field(
+        default=2,
+        metadata={"help": "Denoising steps the student is trained to match the teacher in."},
     )
     plot_loss: bool = field(
         default=False,

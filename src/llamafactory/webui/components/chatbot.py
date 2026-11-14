@@ -58,7 +58,11 @@ def create_chat_box(
         if "resizable" in inspect.signature(gr.Chatbot.__init__).parameters:
             kwargs["resizable"] = True
 
-        chatbot = gr.Chatbot(type="messages", **kwargs)
+        # Gradio 6 dropped type=; messages is the only format. Older builds need it set.
+        if "type" in inspect.signature(gr.Chatbot.__init__).parameters:
+            kwargs["type"] = "messages"
+
+        chatbot = gr.Chatbot(**kwargs)
         messages = gr.State([])
         with gr.Row():
             with gr.Column(scale=4):

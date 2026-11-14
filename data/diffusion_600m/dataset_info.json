@@ -1,0 +1,30 @@
+{
+  "train": {
+    "file_name": "train.jsonl",
+    "columns": {
+      "prompt": "prompt",
+      "response": "response"
+    }
+  },
+  "valid": {
+    "file_name": "valid.jsonl",
+    "columns": {
+      "prompt": "prompt",
+      "response": "response"
+    }
+  },
+  "probe_train": {
+    "file_name": "probe_train.jsonl",
+    "columns": {
+      "prompt": "prompt",
+      "response": "response"
+    }
+  },
+  "probe_valid": {
+    "file_name": "probe_valid.jsonl",
+    "columns": {
+      "prompt": "prompt",
+      "response": "response"
+    }
+  }
+}

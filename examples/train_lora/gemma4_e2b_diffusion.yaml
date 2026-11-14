@@ -1,0 +1,55 @@
+### model
+model_name_or_path: google/gemma-4-E2B-it
+trust_remote_code: true
+
+### method
+stage: diffusion
+do_train: true
+# Section 4 conversion is full weight, not the section 8 LoRA recipe.
+finetuning_type: full
+
+### dataset
+# Pre-wrapped Gemma 4 600M-token bilingual conversion dataset (train / valid / probe_train).
+dataset_dir: /workspace/diffusion_600m
+dataset: train
+eval_dataset: valid
+cutoff_len: 1024
+max_samples: 600000
+overwrite_cache: true
+preprocessing_num_workers: 8
+dataloader_num_workers: 4
+
+### output
+output_dir: /workspace/saves/gemma4-e2b/diffusion
+logging_steps: 10
+save_steps: 500
+save_total_limit: 3
+overwrite_output_dir: true
+save_only_model: true
+report_to: none
+
+### train
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 4
+learning_rate: 6.0e-5
+weight_decay: 1.0e-4
+adam_beta1: 0.95
+adam_beta2: 0.99
+max_grad_norm: 1.0
+max_steps: 20000
+lr_scheduler_type: cosine
+warmup_steps: 200
+bf16: true
+gradient_checkpointing: true
+ddp_timeout: 180000000
+
+### eval
+per_device_eval_batch_size: 4
+eval_strategy: steps
+eval_steps: 500
+load_best_model_at_end: false
+
+### Section 4 is the conversion SFT only. SD-RL is section 5.
+rl_steps: 0
+rl_teacher_steps: 8
+rl_student_steps: 2

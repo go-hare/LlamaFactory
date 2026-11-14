@@ -131,6 +131,7 @@ TRAINING_STAGES = {
     "DPO": "dpo",
     "KTO": "kto",
     "Pre-Training": "pt",
+    "Diffusion": "diffusion",
 }
 
 STAGES_USE_PAIR_DATA = {"rm", "dpo"}

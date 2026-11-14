@@ -20,7 +20,6 @@ import torch
 import torch.distributed as dist
 from transformers import EarlyStoppingCallback, PreTrainedModel
 
-from ..data import get_template_and_fix_tokenizer
 from ..extras import logging
 from ..extras.constants import V_HEAD_SAFE_WEIGHTS_NAME, V_HEAD_WEIGHTS_NAME
 from ..extras.misc import find_available_port, get_device_name, get_torch_device, infer_optim_dtype
@@ -40,12 +39,8 @@ from .callbacks import (
     ReporterCallback,
     TorchProfilerCallback,
 )
-from .dpo import run_dpo
-from .kto import run_kto
-from .ppo import run_ppo
-from .pt import run_pt
-from .rm import run_rm
-from .sft import run_sft
+# Stage runners import trl. Load the one this job uses so the web UI can start
+# on a machine that only has the diffusion dependencies.
 from .trainer_utils import (
     get_placement_group,
     get_ray_head_node_ip,
@@ -136,17 +131,33 @@ def _training_function(config: dict[str, Any]) -> None:
             run_dpo_mca(model_args, data_args, training_args, finetuning_args, callbacks)
 
     elif finetuning_args.stage == "pt":
+        from .pt import run_pt
+
         run_pt(model_args, data_args, training_args, finetuning_args, callbacks)
     elif finetuning_args.stage == "sft":
+        from .sft import run_sft
+
         run_sft(model_args, data_args, training_args, finetuning_args, generating_args, callbacks)
     elif finetuning_args.stage == "rm":
+        from .rm import run_rm
+
         run_rm(model_args, data_args, training_args, finetuning_args, callbacks)
     elif finetuning_args.stage == "ppo":
+        from .ppo import run_ppo
+
         run_ppo(model_args, data_args, training_args, finetuning_args, generating_args, callbacks)
     elif finetuning_args.stage == "dpo":
+        from .dpo import run_dpo
+
         run_dpo(model_args, data_args, training_args, finetuning_args, callbacks)
     elif finetuning_args.stage == "kto":
+        from .kto import run_kto
+
         run_kto(model_args, data_args, training_args, finetuning_args, callbacks)
+    elif finetuning_args.stage == "diffusion":
+        from .diffusion import run_diffusion
+
+        run_diffusion(model_args, data_args, training_args, finetuning_args, generating_args, callbacks)
     else:
         raise ValueError(f"Unknown task: {finetuning_args.stage}.")
 

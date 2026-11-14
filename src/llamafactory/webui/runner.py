@@ -111,6 +111,9 @@ class Runner:
             stage = TRAINING_STAGES[get("train.training_stage")]
             if stage == "ppo" and not get("train.reward_model"):
                 return ALERTS["err_no_reward_model"][lang]
+
+            if stage == "diffusion" and (get("train.neat_packing") or get("train.train_on_prompt") or get("train.mask_history")):
+                return "Diffusion 不用 neat packing、train on prompt、mask history，把这三个关掉。"
         else:
             if not get("eval.output_dir"):
                 return ALERTS["err_no_output_dir"][lang]
@@ -283,7 +286,14 @@ class Runner:
             args["swanlab_mode"] = get("train.swanlab_mode")
 
         # eval config
-        if get("train.val_size") > 1e-6 and args["stage"] != "ppo":
+        if args["stage"] == "diffusion":
+            # Companion data is already split. val_size would re-cut the JSONL, which this stage does not read.
+            args["eval_dataset"] = "valid"
+            args["eval_strategy"] = "steps"
+            args["eval_steps"] = args["save_steps"]
+            args["per_device_eval_batch_size"] = args["per_device_train_batch_size"]
+            args["do_eval"] = True
+        elif get("train.val_size") > 1e-6 and args["stage"] != "ppo":
             args["val_size"] = get("train.val_size")
             args["eval_strategy"] = "steps"
             args["eval_steps"] = args["save_steps"]
