@@ -18,9 +18,9 @@ export PYTHONPATH="${REPO_DIR}/src:${PYTHONPATH:-}"
 MODEL_PATH="${MODEL_PATH:-google/gemma-4-E2B-it}"
 DATA_DIR="${DATA_DIR:-${REPO_DIR}/data/diffusion_600m}"
 OUT_ROOT="${OUT_ROOT:-${REPO_DIR}/saves/gemma4_e2b_lr_sweep}"
-BATCH_SIZE="${BATCH_SIZE:-2}"
-EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-4}"
-GRAD_ACCUM="${GRAD_ACCUM:-4}"
+BATCH_SIZE="${BATCH_SIZE:-1}"
+EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-2}"
+GRAD_ACCUM="${GRAD_ACCUM:-8}"
 MAX_STEPS="${MAX_STEPS:-400}"
 EVAL_STEPS="${EVAL_STEPS:-200}"
 
@@ -63,6 +63,7 @@ for LR in "3.0e-5" "6.0e-5" "1.125e-4"; do
     --eval_steps "${EVAL_STEPS}" \
     --save_steps "${MAX_STEPS}" \
     --bf16 true \
+    --pure_bf16 true \
     --gradient_checkpointing true \
     --report_to none \
     --rl_steps 0 \
@@ -103,7 +104,7 @@ for i, p in enumerate(prompts, 1):
         out = sample_response(
             model,
             ids,
-            max_canvases=2,
+            max_canvases=18,
             steps=48,
             canvas_size=256,
             pad_id=tokenizer.pad_token_id or 0,

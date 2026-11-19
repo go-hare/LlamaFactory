@@ -602,6 +602,10 @@ class FinetuningArguments(
         default=2,
         metadata={"help": "Denoising steps the student is trained to match the teacher in."},
     )
+    diffusion_master_weights: bool = field(
+        default=True,
+        metadata={"help": "Use CPU FP32 master weights and moments (MasterAdamW) when diffusion parameters are BF16."},
+    )
     plot_loss: bool = field(
         default=False,
         metadata={"help": "Whether or not to save the training loss curves."},

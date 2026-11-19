@@ -18,7 +18,8 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from .loss import _embed_distribution, _token_embedding, denoise_step_logits
+from .adapter import get_diffusion_adapter
+from .loss import _embed_distribution, _token_embedding, denoise_step_logits, rcd_residual_signal
 
 
 def _temperature(step: int, total: int, start: float = 0.8, end: float = 0.4, exponent: float = 1.0) -> float:
@@ -56,6 +57,157 @@ def _commit(
     return torch.where(mask, drawn, noise), scaled, entropy
 
 
+def _ddim_step(
+    logits: torch.Tensor,
+    canvas: torch.Tensor,
+    *,
+    time_now: float,
+    time_next: float,
+    temperature: float = 0.7,
+    vocab_size: int,
+    protect_stop_tokens: tuple[int, ...] = (),
+    protect_stop_time: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Official Hackable Diffusion ``DiscreteDDIMStep`` (STAY / NOISE / CLEAN posterior).
+
+    Used by Google's SFT evaluation (``ar_eval.py``) prior to stage-2 sampler
+    distillation, avoiding the 0.1 cumulative-entropy bottleneck on un-distilled checkpoints.
+    """
+    scaled = logits.float() / max(temperature, 1e-6)
+    log_probs = torch.log_softmax(scaled, dim=-1)
+    probs = torch.exp(log_probs)
+    safe_log_probs = torch.where(probs == 0, torch.zeros_like(log_probs), log_probs)
+    entropy = -(safe_log_probs * probs).sum(dim=-1)
+
+    x0 = torch.multinomial(probs.view(-1, probs.shape[-1]), 1).view(canvas.shape)
+    x_noise = torch.randint(0, vocab_size, canvas.shape, device=canvas.device)
+
+    alpha_t = 1.0 - float(time_now)
+    alpha_s = 1.0 - float(time_next)
+    ratio = alpha_t / max(alpha_s, 1e-12)
+    pi = 1.0 / float(vocab_size)
+    ones = torch.ones_like(canvas, dtype=torch.float32)
+
+    p_stay = ones * (ratio * (1.0 - alpha_s) * pi)
+    p_noise = ones * ((1.0 - ratio) * (1.0 - alpha_s) * pi)
+    p_clean = ones * ((1.0 - ratio) * alpha_s * pi)
+
+    same = x0 == canvas
+    if protect_stop_tokens and float(time_now) > float(protect_stop_time):
+        stop_mask = torch.zeros_like(same)
+        for sid in protect_stop_tokens:
+            stop_mask = stop_mask | (canvas == sid)
+        same = same & (~stop_mask)
+    same_f = same.float()
+    p_stay = p_stay + same_f * (ratio * alpha_s + p_clean)
+    p_clean = (1.0 - same_f) * p_clean
+
+    weights = torch.stack([p_stay, p_noise, p_clean], dim=-1).clamp(min=1e-20)
+    route = torch.multinomial(weights.view(-1, 3), 1).view(canvas.shape)
+    next_canvas = torch.where(route == 0, canvas, torch.where(route == 1, x_noise, x0))
+    return next_canvas, scaled, entropy
+
+
+def _mask_unmask_step(
+    logits: torch.Tensor,
+    canvas: torch.Tensor,
+    *,
+    mask_id: int,
+    remaining_steps: int,
+    temperature: float = 0.7,
+    protect_stop_tokens: tuple[int, ...] = (),
+    protect_stop_active: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """BD3-LMs / MDLM absorbing-state unmasking step with SUBS zero-mask-prob constraint.
+
+    Already-unmasked tokens remain locked; among currently masked positions, the
+    most confident ``ceil(num_masked / remaining_steps)`` tokens are unmasked.
+    """
+    scaled = logits.float() / max(temperature, 1e-6)
+    # SUBS parameterization: never emit [MASK] as a clean token prediction.
+    scaled[:, :, int(mask_id)] = -float("inf")
+    log_probs = torch.log_softmax(scaled, dim=-1)
+    probs = torch.exp(log_probs)
+    safe_log_probs = torch.where(probs == 0, torch.zeros_like(log_probs), log_probs)
+    entropy = -(safe_log_probs * probs).sum(dim=-1)
+
+    drawn = torch.multinomial(probs.view(-1, probs.shape[-1]), 1).view(canvas.shape)
+    is_masked = canvas == int(mask_id)
+    next_canvas = canvas.clone()
+
+    for b in range(canvas.shape[0]):
+        masked_pos = is_masked[b].nonzero(as_tuple=False).flatten()
+        n_masked = int(masked_pos.numel())
+        if n_masked == 0:
+            continue
+        k = n_masked if remaining_steps <= 1 else max(1, (n_masked + remaining_steps - 1) // remaining_steps)
+        scores = entropy[b, masked_pos]
+        if protect_stop_active and protect_stop_tokens:
+            stop_hit = torch.zeros_like(scores, dtype=torch.bool)
+            cand = drawn[b, masked_pos]
+            for sid in protect_stop_tokens:
+                stop_hit = stop_hit | (cand == int(sid))
+            # Push premature stop-token candidates to the back while keeping k unlockable if non-stops exist.
+            scores = torch.where(stop_hit, scores + 1e6, scores)
+        chosen_local = scores.topk(min(k, n_masked), largest=False).indices
+        chosen_pos = masked_pos[chosen_local]
+        next_canvas[b, chosen_pos] = drawn[b, chosen_pos]
+
+    return next_canvas, scaled, entropy
+
+
+def _remdm_step(
+    logits: torch.Tensor,
+    canvas: torch.Tensor,
+    *,
+    mask_id: int,
+    time_now: float,
+    time_next: float,
+    temperature: float = 0.7,
+    remask_eta: float = 0.08,
+    protect_stop_tokens: tuple[int, ...] = (),
+    protect_stop_active: bool = False,
+    is_final_step: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """ReMDM confidence-weighted remasking step for absorbing-state [MASK] diffusion."""
+    scaled = logits.float() / max(temperature, 1e-6)
+    scaled[:, :, int(mask_id)] = -float("inf")
+    if protect_stop_active and protect_stop_tokens:
+        for sid in protect_stop_tokens:
+            scaled[:, :, int(sid)] = -float("inf")
+    log_probs = torch.log_softmax(scaled, dim=-1)
+    probs = torch.exp(log_probs)
+    safe_log_probs = torch.where(probs == 0, torch.zeros_like(log_probs), log_probs)
+    entropy = -(safe_log_probs * probs).sum(dim=-1)
+
+    drawn = torch.multinomial(probs.view(-1, probs.shape[-1]), 1).view(canvas.shape)
+    is_masked = canvas == int(mask_id)
+    if is_final_step or time_next <= 1e-6:
+        next_canvas = torch.where(is_masked, drawn, canvas)
+        return next_canvas, scaled, entropy
+
+    alpha_t = max(1.0 - float(time_now), 1e-6)
+    alpha_s = min(max(1.0 - float(time_next), 0.0), 1.0)
+    max_sigma = (1.0 - alpha_s) / alpha_t
+    sigma_cap = min(max(float(remask_eta), 0.0), max_sigma)
+
+    # Remask unmasked tokens proportionally to model disagreement (1 - p(x_t)).
+    safe_tokens = torch.where(is_masked, torch.zeros_like(canvas), canvas)
+    current_prob = probs.gather(-1, safe_tokens.unsqueeze(-1)).squeeze(-1)
+    disagreement = 1.0 - current_prob
+    p_remask = (sigma_cap * disagreement).clamp(0.0, min(1.0, max_sigma))
+    remask_draw = torch.rand_like(p_remask) < p_remask
+
+    p_unmask = min(1.0, max(0.0, (alpha_s - (1.0 - sigma_cap) * alpha_t) / max(1.0 - alpha_t, 1e-6)))
+    unmask_draw = torch.rand_like(p_remask) < p_unmask
+
+    mask_tensor = torch.full_like(canvas, int(mask_id))
+    next_masked = torch.where(unmask_draw, drawn, canvas)
+    next_unmasked = torch.where(remask_draw, mask_tensor, canvas)
+    next_canvas = torch.where(is_masked, next_masked, next_unmasked)
+    return next_canvas, scaled, entropy
+
+
 def sample_canvas(
     model,
     prompt: torch.Tensor,
@@ -66,33 +218,94 @@ def sample_canvas(
     vocab_size: int = 0,
     early_stop: bool = True,
     entropy_threshold: float = 0.005,
+    sampler: str = "entropy",
+    temperature: float = 0.7,
+    protect_stop_tokens: tuple[int, ...] = (),
+    protect_stop_time: float = 0.0,
+    mask_id: int | None = None,
+    remask_eta: float = 0.08,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Denoise one canvas from uniform noise with carried self-conditioning and adaptive stopping."""
+    """Denoise one canvas from uniform noise or [MASK] prior with carried self-conditioning."""
+    if sampler not in ("entropy", "ddim", "mask", "remdm", "rcd"):
+        raise ValueError(f"Unknown diffusion sampler: {sampler}")
+    if sampler in ("mask", "remdm", "rcd") and mask_id is None:
+        raise ValueError(f"sampler={sampler!r} requires an explicit mask_id.")
     text_config = getattr(model.config, "text_config", model.config)
     if vocab_size <= 0:
         vocab_size = int(getattr(text_config, "vocab_size", 0) or model.config.vocab_size)
     hidden_size = int(getattr(text_config, "hidden_size", 0) or model.config.hidden_size)
     token_embedding = _token_embedding(model)
-    canvas = torch.randint(0, vocab_size, (1, canvas_size), device=prompt.device)
+    embed_scale = get_diffusion_adapter(model).embed_scale(model)
+    if sampler in ("mask", "remdm", "rcd"):
+        canvas = torch.full((1, canvas_size), int(mask_id), dtype=torch.long, device=prompt.device)
+    else:
+        canvas = torch.randint(0, vocab_size, (1, canvas_size), device=prompt.device)
     sc_embeddings = torch.zeros(1, canvas_size, hidden_size, device=prompt.device, dtype=token_embedding.weight.dtype)
     mean_entropy = torch.zeros((), device=prompt.device)
+    ddim_times = torch.linspace(1.0 - 1e-6, 0.0, steps + 1, device=prompt.device) if sampler in ("ddim", "remdm", "rcd") else None
     for step in range(steps):
         is_final_step = (step + 1) >= steps
         logits = denoise_step_logits(model, prompt, canvas[0], sc_embeddings=sc_embeddings, pad_id=pad_id)
-        next_canvas, shaped_logits, token_entropy = _commit(
-            logits,
-            canvas,
-            temperature=_temperature(step, steps),
-            entropy_bound=0.1,
-            vocab_size=vocab_size,
-            is_final_step=is_final_step,
-        )
+        if sampler == "entropy":
+            next_canvas, shaped_logits, token_entropy = _commit(
+                logits,
+                canvas,
+                temperature=_temperature(step, steps),
+                entropy_bound=0.1,
+                vocab_size=vocab_size,
+                is_final_step=is_final_step,
+            )
+        elif sampler == "mask":
+            progress = 1.0 - (step / max(steps, 1))
+            next_canvas, shaped_logits, token_entropy = _mask_unmask_step(
+                logits,
+                canvas,
+                mask_id=int(mask_id),
+                remaining_steps=steps - step,
+                temperature=temperature,
+                protect_stop_tokens=protect_stop_tokens,
+                protect_stop_active=bool(protect_stop_tokens) and (progress > float(protect_stop_time)),
+            )
+        elif sampler in ("remdm", "rcd"):
+            time_now = float(ddim_times[step])
+            next_canvas, shaped_logits, token_entropy = _remdm_step(
+                logits,
+                canvas,
+                mask_id=int(mask_id),
+                time_now=time_now,
+                time_next=float(ddim_times[step + 1]),
+                temperature=temperature,
+                remask_eta=remask_eta,
+                protect_stop_tokens=protect_stop_tokens,
+                protect_stop_active=bool(protect_stop_tokens) and (time_now > float(protect_stop_time)),
+                is_final_step=is_final_step,
+            )
+        else:
+            next_canvas, shaped_logits, token_entropy = _ddim_step(
+                logits,
+                canvas,
+                time_now=float(ddim_times[step]),
+                time_next=float(ddim_times[step + 1]),
+                temperature=temperature,
+                vocab_size=vocab_size,
+                protect_stop_tokens=protect_stop_tokens,
+                protect_stop_time=protect_stop_time,
+            )
         mean_entropy = token_entropy.mean()
-        sc_embeddings = _embed_distribution(token_embedding, shaped_logits)
+        if sampler == "rcd":
+            sc_embeddings = rcd_residual_signal(
+                token_embedding,
+                shaped_logits,
+                next_canvas,
+                mask_id=int(mask_id),
+                scale=embed_scale,
+            )
+        else:
+            sc_embeddings = _embed_distribution(token_embedding, shaped_logits, scale=embed_scale)
         stable = bool((shaped_logits.argmax(dim=-1) == canvas).all())
         confident = bool(mean_entropy <= entropy_threshold)
-        if early_stop and stable and confident:
-            canvas = shaped_logits.argmax(dim=-1)
+        if early_stop and stable and confident and not (sampler in ("mask", "remdm", "rcd") and bool((next_canvas == int(mask_id)).any())):
+            canvas = next_canvas
             break
         canvas = next_canvas
     return canvas, mean_entropy.detach()
@@ -102,13 +315,18 @@ def sample_response(
     model,
     prompt: torch.Tensor,
     *,
-    max_canvases: int = 4,
+    max_canvases: int = 18,
     steps: int = 48,
     canvas_size: int = 256,
     pad_id: int = 0,
     stop_tokens: tuple[int, ...] = (1, 106),
     vocab_size: int = 0,
     early_stop: bool = True,
+    sampler: str = "entropy",
+    temperature: float = 0.7,
+    protect_stop_time: float = 0.0,
+    mask_id: int | None = None,
+    remask_eta: float = 0.08,
 ) -> torch.Tensor:
     """Block-autoregressive generation across canvases, truncating at the first stop token."""
     running_prompt = prompt.view(-1)
@@ -123,6 +341,12 @@ def sample_response(
             pad_id=pad_id,
             vocab_size=vocab_size,
             early_stop=early_stop,
+            sampler=sampler,
+            temperature=temperature,
+            protect_stop_tokens=stop_tokens if protect_stop_time > 0 else (),
+            protect_stop_time=protect_stop_time,
+            mask_id=mask_id,
+            remask_eta=remask_eta,
         )
         row = canvas[0]
         hit_idx = None

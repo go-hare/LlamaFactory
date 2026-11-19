@@ -5,15 +5,15 @@ trust_remote_code: true
 ### method
 stage: diffusion
 do_train: true
-# Section 4 conversion is full weight, not the section 8 LoRA recipe.
+# Section 4 conversion: full-parameter training from AR E2B, not LoRA / not section 8.
 finetuning_type: full
 
 ### dataset
-# Pre-wrapped Gemma 4 600M-token bilingual conversion dataset (train / valid / probe_train).
 dataset_dir: /workspace/diffusion_600m
 dataset: train
 eval_dataset: valid
-cutoff_len: 1024
+# Prompt cap ~p99. Response is K=18 * C=256 = 4608 in workflow.py.
+cutoff_len: 4096
 max_samples: 600000
 overwrite_cache: true
 preprocessing_num_workers: 8
@@ -22,34 +22,37 @@ dataloader_num_workers: 4
 ### output
 output_dir: /workspace/saves/gemma4-e2b/diffusion
 logging_steps: 10
-save_steps: 500
+save_steps: 2000
 save_total_limit: 3
 overwrite_output_dir: true
 save_only_model: true
 report_to: none
 
 ### train
-per_device_train_batch_size: 2
-gradient_accumulation_steps: 4
-learning_rate: 6.0e-5
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 8
+learning_rate: 1.125e-4
 weight_decay: 1.0e-4
 adam_beta1: 0.95
 adam_beta2: 0.99
 max_grad_norm: 1.0
-max_steps: 20000
+num_train_epochs: 1
 lr_scheduler_type: cosine
 warmup_steps: 200
 bf16: true
+pure_bf16: true
+# Keep BF16 weights/grads on GPU (~20 GiB) while accumulating FP32 master weights + moments in host RAM.
+diffusion_master_weights: true
 gradient_checkpointing: true
 ddp_timeout: 180000000
 
 ### eval
-per_device_eval_batch_size: 4
+per_device_eval_batch_size: 1
 eval_strategy: steps
-eval_steps: 500
+eval_steps: 2000
 load_best_model_at_end: false
 
-### Section 4 is the conversion SFT only. SD-RL is section 5.
+### Section 5 off until named.
 rl_steps: 0
 rl_teacher_steps: 8
 rl_student_steps: 2
