@@ -495,6 +495,442 @@ def diffusion_batch_step(
     return mean_loss, parts
 
 
+def _build_all_blocks_mask(
+    clean_valid: torch.Tensor,
+    noisy_valid: torch.Tensor,
+    prompt_lengths: list[int],
+    start_blocks: list[int],
+    num_sel_blocks: list[int],
+    canvas_size: int,
+) -> torch.Tensor:
+    """Build exact staircase block-diffusion attention mask ``[B, 1, C_len + N_len, C_len + N_len]``.
+
+    - Clean prefix tokens attend causally within valid clean positions and NEVER see noisy blocks.
+    - Noisy block ``m`` (corresponding to response block ``blk = start_blocks[b] + m``) attends
+      bidirectionally within its own ``canvas_size`` tokens and sees ONLY clean tokens in
+      ``[0, prompt_lengths[b] + blk * canvas_size)``.
+    """
+    batch, max_clean = clean_valid.shape
+    max_noisy = noisy_valid.shape[1]
+    device = clean_valid.device
+    total = max_clean + max_noisy
+    allowed = torch.zeros((batch, 1, total, total), dtype=torch.bool, device=device)
+
+    # Clean-to-clean: standard causal over valid clean keys.
+    if max_clean > 0:
+        cq = torch.arange(max_clean, device=device)[:, None]
+        ck = torch.arange(max_clean, device=device)[None, :]
+        allowed[:, 0, :max_clean, :max_clean] = (cq >= ck)[None, :, :] & clean_valid[:, None, :]
+
+    # Noisy-to-clean and noisy-to-noisy per row.
+    clean_pos = torch.arange(max_clean, device=device)
+    for b in range(batch):
+        p_len = int(prompt_lengths[b])
+        s_blk = int(start_blocks[b])
+        n_blk = int(num_sel_blocks[b])
+        c_val = clean_valid[b]
+        for m in range(n_blk):
+            q_start = max_clean + m * canvas_size
+            q_end = q_start + canvas_size
+            q_valid = noisy_valid[b, m * canvas_size : (m + 1) * canvas_size]
+            # Noisy block (s_blk + m) sees prompt + clean blocks 0 .. (s_blk + m - 1).
+            prefix_limit = p_len + (s_blk + m) * canvas_size
+            if max_clean > 0 and prefix_limit > 0:
+                k_clean_ok = c_val & (clean_pos < prefix_limit)
+                allowed[b, 0, q_start:q_end, :max_clean] = q_valid[:, None] & k_clean_ok[None, :]
+            # Strictly bidirectional within the same block; zero attention to other noisy blocks.
+            allowed[b, 0, q_start:q_end, q_start:q_end] = q_valid[:, None] & q_valid[None, :]
+
+    return allowed
+
+
+def _topk_forward_kl(
+    student_logits: torch.Tensor,
+    teacher_top_p: torch.Tensor,
+    teacher_top_idx: torch.Tensor,
+    *,
+    kl_temp: float = 1.0,
+) -> torch.Tensor:
+    """Rao-Blackwellized sparse top-K forward KL ``D_KL(p_AR || p_diff)`` per token (>= 0)."""
+    temp = max(float(kl_temp), 1e-4)
+    student_log_probs = F.log_softmax(student_logits.float() / temp, dim=-1)
+    gathered = student_log_probs.gather(-1, teacher_top_idx)
+    kl = (teacher_top_p * (torch.log(teacher_top_p.clamp_min(1e-12)) - gathered)).sum(dim=-1)
+    return kl * (temp * temp)
+
+
+@torch.no_grad()
+def _compute_ar_teacher_topk(
+    ar_teacher,
+    clean_full_seqs: list[torch.Tensor],
+    prompt_lengths: list[int],
+    start_blocks: list[int],
+    num_sel_blocks: list[int],
+    canvas_size: int,
+    *,
+    pad_id: int,
+    kl_topk: int,
+    kl_temp: float,
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """Run one causal AR teacher forward pass and extract top-K soft targets for each row's selected blocks."""
+    device = clean_full_seqs[0].device
+    batch = len(clean_full_seqs)
+    max_len = max(seq.numel() for seq in clean_full_seqs)
+    input_ids = torch.full((batch, max_len), pad_id, dtype=torch.long, device=device)
+    attn_mask = torch.zeros((batch, max_len), dtype=torch.long, device=device)
+    for b, seq in enumerate(clean_full_seqs):
+        L = seq.numel()
+        input_ids[b, :L] = seq
+        attn_mask[b, :L] = (seq != pad_id).long()
+
+    min_start = min(int(p_len) + int(s_blk) * canvas_size - 1 for p_len, s_blk in zip(prompt_lengths, start_blocks))
+    keep_n = max_len - min_start
+    use_keep = _supports_logits_to_keep(ar_teacher) and 0 < keep_n < max_len
+    extra = {"logits_to_keep": keep_n} if use_keep else {}
+    out = ar_teacher(input_ids=input_ids, attention_mask=attn_mask, use_cache=False, **extra)
+    logits = out.logits
+    offset = (max_len - keep_n) if use_keep else 0
+    vocab_size = logits.shape[-1]
+    k = min(max(int(kl_topk), 1), vocab_size)
+    temp = max(float(kl_temp), 1e-4)
+
+    results: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for b in range(batch):
+        p_len = int(prompt_lengths[b])
+        s_blk = int(start_blocks[b])
+        n_blk = int(num_sel_blocks[b])
+        n_tok = n_blk * canvas_size
+        # Causal shift: position (p_len + j - 1) predicts response token j.
+        start_pos = p_len + s_blk * canvas_size - 1 - offset
+        end_pos = start_pos + n_tok
+        row_logits = logits[b, start_pos:end_pos].float()
+        top_vals, top_idx = torch.topk(row_logits, k=k, dim=-1)
+        top_p = torch.softmax(top_vals / temp, dim=-1)
+        results.append((top_p, top_idx))
+    return results
+
+
+def diffusion_all_blocks_step(
+    model,
+    prompts: list[torch.Tensor],
+    responses: list[torch.Tensor],
+    *,
+    canvas_size: int,
+    num_canvases: int,
+    pad_id: int,
+    eos_id: int,
+    time_eps: float = 1e-4,
+    time_min: float | None = None,
+    time_max: float | None = None,
+    diagnostics: bool = False,
+    loss_mode: str | DiffusionObjective = "canvas-mean",
+    corruption_mode: str | CorruptionProcess = "uniform",
+    mask_id: int | None = None,
+    max_train_blocks: int = 6,
+    ar_teacher=None,
+    kl_weight: float = 0.0,
+    kl_topk: int = 64,
+    kl_temp: float = 1.0,
+    residual_mode: str = "standard",
+    ref_model=None,
+) -> tuple[torch.Tensor, dict]:
+    """Multi-block parallel section-4 conversion step with optional frozen AR-teacher top-K KL distillation.
+
+    Trains up to ``max_train_blocks`` contiguous canvases per row in ONE staircase forward pass,
+    mathematically identical to running each block separately with full clean history, while
+    optionally adding Rao-Blackwellized forward KL distillation from a frozen causal AR teacher
+    strictly on non-padded ``body`` tokens.
+    """
+    if not prompts:
+        raise ValueError("Diffusion batch is empty.")
+    if residual_mode not in ("standard", "rcd"):
+        raise ValueError(f"Unknown residual_mode: {residual_mode}")
+    corruption = resolve_corruption(corruption_mode, mask_id=mask_id)
+    objective = resolve_objective(loss_mode)
+    device = _token_embedding(model).weight.device
+    text_config = getattr(model.config, "text_config", model.config)
+    vocab_size = int(getattr(text_config, "vocab_size", 0) or model.config.vocab_size)
+    hidden_size = int(getattr(text_config, "hidden_size", 0) or model.config.hidden_size)
+    window = getattr(text_config, "sliding_window", None)
+    adapter = get_diffusion_adapter(model)
+    token_embedding = _token_embedding(model)
+    model_dtype = token_embedding.weight.dtype
+
+    batch_size = len(prompts)
+    first_indices = torch.arange(num_canvases, device=device) * canvas_size
+
+    clean_prefix_seqs: list[torch.Tensor] = []
+    clean_prefix_valids: list[torch.Tensor] = []
+    clean_full_seqs: list[torch.Tensor] = []
+    noisy_seqs: list[torch.Tensor] = []
+    noisy_targets: list[torch.Tensor] = []
+    noisy_valids: list[torch.Tensor] = []
+    noisy_corrupted: list[torch.Tensor] = []
+    noisy_pos_lists: list[torch.Tensor] = []
+    prompt_lengths: list[int] = []
+    start_blocks: list[int] = []
+    num_sel_blocks: list[int] = []
+    block_times_per_row: list[list[float]] = []
+    block_body_lens_per_row: list[list[int]] = []
+    diagnostic_rows: list[dict] = []
+
+    use_kl = ar_teacher is not None and float(kl_weight) > 0.0
+
+    for p_raw, r_raw in zip(prompts, responses):
+        p = p_raw.to(device=device, dtype=torch.long).view(-1)
+        r = r_raw.to(device=device, dtype=torch.long).view(-1)
+        if p.numel() == 0:
+            raise ValueError("Diffusion prompt is empty.")
+        canvas, _, canvas_mask = _chunk(r, num_canvases, canvas_size, eos_id, pad_id)
+        num_valid_blocks = int(canvas_mask[first_indices].sum().clamp(min=1).item())
+        cap = max(1, int(max_train_blocks))
+        if num_valid_blocks > cap:
+            start_blk = int(torch.randint(0, num_valid_blocks - cap + 1, (), device=device).item())
+            n_sel = cap
+        else:
+            start_blk = 0
+            n_sel = num_valid_blocks
+
+        # Last selected block index is (start_blk + n_sel - 1); clean prefix only needs blocks < last_sel!
+        prefix_blocks = start_blk + n_sel - 1
+        prefix_len = prefix_blocks * canvas_size
+        p_len = int(p.numel())
+
+        c_pref = torch.cat([p, canvas[:prefix_len]], dim=0) if prefix_len > 0 else p
+        c_pref_valid = torch.cat([p != pad_id, canvas_mask[:prefix_len]], dim=0) if prefix_len > 0 else (p != pad_id)
+        clean_prefix_seqs.append(c_pref)
+        clean_prefix_valids.append(c_pref_valid)
+
+        if use_kl:
+            end_clean_len = (start_blk + n_sel) * canvas_size
+            clean_full_seqs.append(torch.cat([p, canvas[:end_clean_len]], dim=0))
+
+        # Corrupt each selected block independently with its own noise level t_k.
+        row_noisy, row_targets, row_valids, row_corrupted, row_times, row_bodies = [], [], [], [], [], []
+        for m in range(n_sel):
+            blk_idx = start_blk + m
+            sl = slice(blk_idx * canvas_size, (blk_idx + 1) * canvas_size)
+            clean_blk = canvas[sl]
+            valid_blk = canvas_mask[sl]
+            cs = corruption.corrupt(
+                clean_blk,
+                vocab_size=vocab_size,
+                time_eps=time_eps,
+                time_min=time_min,
+                time_max=time_max,
+            )
+            row_noisy.append(cs.noisy)
+            row_targets.append(clean_blk)
+            row_valids.append(valid_blk)
+            row_corrupted.append(cs.corrupted)
+            row_times.append(cs.time)
+            row_bodies.append(max(0, min(canvas_size, r.numel() - blk_idx * canvas_size)))
+
+        noisy_seqs.append(torch.cat(row_noisy, dim=0))
+        noisy_targets.append(torch.cat(row_targets, dim=0))
+        noisy_valids.append(torch.cat(row_valids, dim=0))
+        noisy_corrupted.append(torch.cat(row_corrupted, dim=0))
+        # Exact RoPE positions for noisy blocks: start at (valid_prompt_tokens + start_blk * canvas_size).
+        valid_p_count = int((p != pad_id).sum().item())
+        noisy_pos_lists.append(
+            torch.arange(n_sel * canvas_size, device=device, dtype=torch.long)
+            + valid_p_count
+            + start_blk * canvas_size
+        )
+        prompt_lengths.append(p_len)
+        start_blocks.append(start_blk)
+        num_sel_blocks.append(n_sel)
+        block_times_per_row.append(row_times)
+        block_body_lens_per_row.append(row_bodies)
+
+    ar_targets = (
+        _compute_ar_teacher_topk(
+            ar_teacher,
+            clean_full_seqs,
+            prompt_lengths,
+            start_blocks,
+            num_sel_blocks,
+            canvas_size,
+            pad_id=pad_id,
+            kl_topk=kl_topk,
+            kl_temp=kl_temp,
+        )
+        if use_kl
+        else None
+    )
+
+    max_clean = max(seq.numel() for seq in clean_prefix_seqs)
+    max_noisy = max(seq.numel() for seq in noisy_seqs)
+    total = max_clean + max_noisy
+
+    tokens = torch.full((batch_size, total), pad_id, dtype=torch.long, device=device)
+    clean_valid_batch = torch.zeros((batch_size, max_clean), dtype=torch.bool, device=device)
+    noisy_valid_batch = torch.zeros((batch_size, max_noisy), dtype=torch.bool, device=device)
+    position_ids = torch.zeros((batch_size, total), dtype=torch.long, device=device)
+
+    for b in range(batch_size):
+        clen = clean_prefix_seqs[b].numel()
+        nlen = noisy_seqs[b].numel()
+        tokens[b, :clen] = clean_prefix_seqs[b]
+        clean_valid_batch[b, :clen] = clean_prefix_valids[b]
+        if clen > 0:
+            position_ids[b, :clen] = (clean_prefix_valids[b].long().cumsum(dim=-1) - 1).clamp(min=0)
+        tokens[b, max_clean : max_clean + nlen] = noisy_seqs[b]
+        noisy_valid_batch[b, :nlen] = noisy_valids[b]
+        position_ids[b, max_clean : max_clean + nlen] = noisy_pos_lists[b]
+
+    allowed = _build_all_blocks_mask(
+        clean_valid_batch,
+        noisy_valid_batch,
+        prompt_lengths,
+        start_blocks,
+        num_sel_blocks,
+        canvas_size,
+    )
+    valid_batch = torch.cat([clean_valid_batch, noisy_valid_batch], dim=1)
+    attn_masks = _gemma_masks(allowed, model_dtype, valid=valid_batch, sliding_window=window, model=model)
+
+    zero_signal = torch.zeros((batch_size, max_noisy, hidden_size), device=device, dtype=model_dtype)
+    ref = ref_model if (residual_mode == "rcd" and ref_model is not None) else model
+    ref_keep = max_noisy if _supports_logits_to_keep(ref) else None
+    use_signal = torch.rand((batch_size, 1, 1), device=device) < 0.5
+    signal = zero_signal
+    if bool(use_signal.any()):
+        active_idx = use_signal.view(-1).nonzero(as_tuple=False).flatten()
+        if active_idx.numel() == batch_size:
+            sub_tokens, sub_zero, sub_masks, sub_pos = tokens, zero_signal, attn_masks, position_ids
+        else:
+            sub_tokens = tokens.index_select(0, active_idx)
+            sub_zero = zero_signal.index_select(0, active_idx)
+            sub_masks = {k: v.index_select(0, active_idx) for k, v in attn_masks.items()}
+            sub_pos = position_ids.index_select(0, active_idx)
+        with torch.no_grad():
+            first = _diffusion_forward(
+                ref, sub_tokens, sub_zero, max_clean, sub_masks, sub_pos, logits_to_keep=ref_keep
+            )
+        first_logits = first.logits if ref_keep is not None else first.logits[:, max_clean:]
+        if residual_mode == "rcd":
+            embedded_first = rcd_residual_signal(
+                token_embedding,
+                first_logits,
+                sub_tokens[:, max_clean:],
+                mask_id=mask_id,
+                scale=adapter.embed_scale(model),
+            )
+        else:
+            embedded_first = _embed_distribution(token_embedding, first_logits, scale=adapter.embed_scale(model))
+        if active_idx.numel() == batch_size:
+            signal = embedded_first
+        else:
+            signal = zero_signal.clone()
+            signal.index_copy_(0, active_idx, embedded_first)
+
+    dec_keep = max_noisy if _supports_logits_to_keep(model) else None
+    decoder = _diffusion_forward(
+        model, tokens, signal, max_clean, attn_masks, position_ids, logits_to_keep=dec_keep
+    )
+    noisy_logits = decoder.logits if dec_keep is not None else decoder.logits[:, max_clean:]
+
+    block_ce_losses: list[torch.Tensor] = []
+    block_kl_losses: list[torch.Tensor] = []
+    total_blocks = 0
+
+    for b in range(batch_size):
+        n_sel = num_sel_blocks[b]
+        s_blk = start_blocks[b]
+        t_row = noisy_targets[b]
+        v_row = noisy_valids[b]
+        c_row = noisy_corrupted[b]
+        ar_row = ar_targets[b] if ar_targets is not None else None
+
+        row_body_ce = 0.0
+        row_body_cnt = 0
+        row_tail_ce = 0.0
+        row_tail_cnt = 0
+        row_changed_sum = 0.0
+
+        for m in range(n_sel):
+            sl = slice(m * canvas_size, (m + 1) * canvas_size)
+            b_logits = noisy_logits[b, sl]
+            b_targets = t_row[sl]
+            b_valid = v_row[sl]
+            b_corr = c_row[sl]
+            b_body_len = block_body_lens_per_row[b][m]
+            b_time = block_times_per_row[b][m]
+            if not bool(b_valid.any()):
+                raise RuntimeError("Diffusion decoder selected no canvas tokens.")
+            if not torch.isfinite(b_logits[b_valid]).all():
+                raise RuntimeError("Decoder logits are non-finite on the selected canvas.")
+
+            ce_loss = objective.compute(
+                b_logits,
+                b_targets,
+                b_valid,
+                b_corr,
+                body_tokens=b_body_len,
+                time=b_time,
+            )
+            block_ce_losses.append(ce_loss)
+            total_blocks += 1
+
+            if ar_row is not None and b_body_len > 0:
+                body_mask = (torch.arange(canvas_size, device=device) < b_body_len) & b_valid
+                if bool(body_mask.any()):
+                    top_p, top_idx = ar_row
+                    kl_tok = _topk_forward_kl(
+                        b_logits[body_mask],
+                        top_p[sl][body_mask],
+                        top_idx[sl][body_mask],
+                        kl_temp=kl_temp,
+                    )
+                    block_kl_losses.append(kl_tok.mean())
+
+            if diagnostics:
+                ce_vec = F.cross_entropy(b_logits.detach().float(), b_targets, reduction="none")
+                body_mask = (torch.arange(canvas_size, device=device) < b_body_len) & b_valid
+                tail_mask = (~body_mask) & b_valid
+                row_body_ce += float(ce_vec[body_mask].sum())
+                row_body_cnt += int(body_mask.sum())
+                row_tail_ce += float(ce_vec[tail_mask].sum())
+                row_tail_cnt += int(tail_mask.sum())
+                row_changed_sum += float(b_corr.float().mean())
+
+        if diagnostics:
+            diagnostic_rows.append(
+                dict(
+                    time=sum(block_times_per_row[b]) / max(n_sel, 1),
+                    selected_block=s_blk,
+                    num_blocks=n_sel,
+                    body_tokens=row_body_cnt,
+                    changed_fraction=row_changed_sum / max(n_sel, 1),
+                    body_ce_sum=row_body_ce,
+                    body_count=row_body_cnt,
+                    tail_ce_sum=row_tail_ce,
+                    tail_count=row_tail_cnt,
+                )
+            )
+
+    mean_ce = torch.stack(block_ce_losses).mean()
+    if block_kl_losses and float(kl_weight) > 0.0:
+        mean_kl = torch.stack(block_kl_losses).mean()
+        total_loss = mean_ce + float(kl_weight) * mean_kl
+        kl_val = float(mean_kl.detach())
+    else:
+        total_loss = mean_ce
+        kl_val = 0.0
+
+    parts = {
+        "decoder_loss": float(total_loss.detach()),
+        "ce_loss": float(mean_ce.detach()),
+        "kl_loss": kl_val,
+        "trained_blocks": total_blocks,
+        "trained_tokens": total_blocks * canvas_size,
+    }
+    if diagnostics:
+        parts["rows"] = diagnostic_rows
+    return total_loss, parts
+
+
 def diffusion_step(
     model,
     prompt: torch.Tensor,

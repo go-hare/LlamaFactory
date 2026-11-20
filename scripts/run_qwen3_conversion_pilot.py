@@ -27,6 +27,7 @@ from validate_diffusion_conversion import ByteTokenizer, preserve_rng
 from llamafactory.train.diffusion.loss import (
     _get_conditioner,
     denoise_logits,
+    diffusion_all_blocks_step,
     diffusion_batch_step,
     prepare_conversion_training,
 )
@@ -427,6 +428,15 @@ def arguments():
     parser.add_argument("--warmup-steps", type=int, default=50)
     parser.add_argument("--min-lr-ratio", type=float, default=0.1)
     parser.add_argument("--optimizer-mode", choices=["auto", "fp32-master", "gpu-adamw"], default="auto")
+    parser.add_argument("--training-mode", choices=["single-block", "all-blocks"], default="single-block")
+    parser.add_argument("--max-train-blocks", type=int, default=6, help="Max contiguous blocks per row in all-blocks mode")
+    parser.add_argument("--ar-teacher", type=str, default=None, help="Frozen AR teacher model for top-K soft-logit KL distillation")
+    parser.add_argument("--kl-weight", type=float, default=0.0, help="Weight on AR teacher forward KL loss (body tokens only)")
+    parser.add_argument("--kl-topk", type=int, default=64, help="Top-K vocabulary entries kept from AR teacher distribution")
+    parser.add_argument("--kl-temp", type=float, default=1.0, help="Temperature for AR teacher KL distillation")
+    parser.add_argument("--data-offset", type=int, default=0, help="Row schedule offset to skip previously trained rows")
+    parser.add_argument("--init-self-conditioner", type=Path, default=None, help="Preload unwrapped SelfConditioner weights before LoRA")
+    parser.add_argument("--cudnn-sdp", action="store_true", help="Prefer CUDNN SDPA over slower mem-efficient SDPA (Blackwell)")
     parser.add_argument("--keep-checkpoints", type=int, default=2)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--tiny", action="store_true")
@@ -435,6 +445,13 @@ def arguments():
 
 def main():
     args = arguments()
+    if args.cudnn_sdp and torch.cuda.is_available():
+        torch.backends.cuda.enable_cudnn_sdp(True)
+        torch.backends.cuda.enable_flash_sdp(True)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_math_sdp(True)
+    if args.ar_teacher and args.kl_weight > 0.0 and args.training_mode != "all-blocks":
+        raise ValueError("--ar-teacher with --kl-weight > 0 requires --training-mode all-blocks")
     fresh_destination(args.out)
     hardware = preflight(args.tiny, args.out)
     print("PREFLIGHT", hardware, flush=True)
@@ -448,6 +465,17 @@ def main():
         splits = load_qwen3_splits(args.data, tokenizer)
         model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16).cuda()
 
+    ar_teacher = None
+    if args.ar_teacher and args.kl_weight > 0.0 and not args.eval_only:
+        if args.tiny:
+            ar_teacher, _, _ = tiny_setup()
+            ar_teacher = ar_teacher.to(next(model.parameters()).device).eval()
+        else:
+            ar_teacher = AutoModelForCausalLM.from_pretrained(args.ar_teacher, dtype=torch.bfloat16).cuda().eval()
+        for param in ar_teacher.parameters():
+            param.requires_grad_(False)
+        print("AR_TEACHER_LOADED", {"model": args.ar_teacher, "kl_weight": args.kl_weight, "kl_topk": args.kl_topk, "kl_temp": args.kl_temp}, flush=True)
+
     pad_id, eos_id, stop_tokens = resolve_special_ids(tokenizer)
     vocab_size = int(getattr(getattr(model.config, "text_config", model.config), "vocab_size", 0) or model.config.vocab_size)
     mask_id = (
@@ -456,6 +484,9 @@ def main():
         else resolve_mask_id(tokenizer, vocab_size, pad_id=pad_id, eos_id=eos_id)
     )
     prepare_conversion_training(model)
+    if args.init_self_conditioner and not args.resume:
+        _get_conditioner(model).load_state_dict(load_file(str(args.init_self_conditioner)), strict=True)
+        print("INIT_SELF_CONDITIONER_LOADED", str(args.init_self_conditioner), flush=True)
     model = apply_lora_if_requested(model, args.lora_rank)
     if hasattr(model, "enable_input_require_grads") and args.lora_rank > 0:
         model.enable_input_require_grads()
@@ -567,13 +598,21 @@ def main():
             for group in optimizer.param_groups:
                 group["lr"] = lr
             records, loss_sum = [], 0.0
+            ce_loss_sum, kl_loss_sum = 0.0, 0.0
+            trained_blocks_sum, trained_tokens_sum = 0, 0
             effective_batch = max(1, args.grad_accum * args.micro_batch)
             step_items = []
+            canvas = settings["canvas"]
             for offset in range(effective_batch):
                 micro = (step - 1) * effective_batch + offset
-                index = schedule_index(micro, len(splits["train"]))
+                index = schedule_index(micro + args.data_offset, len(splits["train"]))
                 prompt, target = tensor_row(splits["train"][index], device)
-                est_len = int(prompt.numel() + min(target.numel(), settings["canvas"] * 18) // 2 + settings["canvas"])
+                if args.training_mode == "all-blocks":
+                    n_active = min(max(1, (target.numel() + canvas - 1) // canvas), 18)
+                    n_sel = min(n_active, max(1, args.max_train_blocks))
+                    est_len = int(prompt.numel() + (n_active - 1) * canvas + n_sel * canvas)
+                else:
+                    est_len = int(prompt.numel() + min(target.numel(), canvas * 18) // 2 + canvas)
                 step_items.append((micro, index, prompt, target, est_len))
             if args.micro_batch > 1:
                 step_items.sort(key=lambda item: item[4])
@@ -592,31 +631,71 @@ def main():
 
             for chunk in chunks:
                 torch.manual_seed(420000 + chunk[0][0])
-                loss, parts = diffusion_batch_step(
-                    model,
-                    [c[2] for c in chunk],
-                    [c[3] for c in chunk],
-                    canvas_size=settings["canvas"],
-                    num_canvases=18,
-                    pad_id=pad_id,
-                    eos_id=eos_id,
-                    time_min=args.time_min,
-                    time_max=args.time_max,
-                    diagnostics=True,
-                    loss_mode=args.loss_mode,
-                    corruption_mode=args.corruption_mode,
-                    mask_id=mask_id,
-                    residual_mode=args.residual_mode,
-                )
+                if args.training_mode == "all-blocks":
+                    loss, parts = diffusion_all_blocks_step(
+                        model,
+                        [c[2] for c in chunk],
+                        [c[3] for c in chunk],
+                        canvas_size=canvas,
+                        num_canvases=18,
+                        pad_id=pad_id,
+                        eos_id=eos_id,
+                        time_min=args.time_min,
+                        time_max=args.time_max,
+                        diagnostics=True,
+                        loss_mode=args.loss_mode,
+                        corruption_mode=args.corruption_mode,
+                        mask_id=mask_id,
+                        max_train_blocks=args.max_train_blocks,
+                        ar_teacher=ar_teacher,
+                        kl_weight=args.kl_weight,
+                        kl_topk=args.kl_topk,
+                        kl_temp=args.kl_temp,
+                        residual_mode=args.residual_mode,
+                    )
+                    trained_blocks_sum += int(parts.get("trained_blocks", 0))
+                    trained_tokens_sum += int(parts.get("trained_tokens", 0))
+                else:
+                    loss, parts = diffusion_batch_step(
+                        model,
+                        [c[2] for c in chunk],
+                        [c[3] for c in chunk],
+                        canvas_size=canvas,
+                        num_canvases=18,
+                        pad_id=pad_id,
+                        eos_id=eos_id,
+                        time_min=args.time_min,
+                        time_max=args.time_max,
+                        diagnostics=True,
+                        loss_mode=args.loss_mode,
+                        corruption_mode=args.corruption_mode,
+                        mask_id=mask_id,
+                        residual_mode=args.residual_mode,
+                    )
+                    trained_blocks_sum += len(chunk)
+                    trained_tokens_sum += len(chunk) * canvas
                 weight = len(chunk) / effective_batch
                 (loss * weight).backward()
                 loss_sum += float(loss.detach()) * weight
+                ce_loss_sum += float(parts.get("ce_loss", float(loss.detach()))) * weight
+                kl_loss_sum += float(parts.get("kl_loss", 0.0)) * weight
                 for item, diag in zip(chunk, parts["rows"]):
                     records.append(dict(row=item[1], **diag))
             norm = torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
             optimizer.step()
             block_counts.update(str(r["selected_block"]) for r in records)
-            record = {"step": step, "loss": loss_sum, "grad": float(norm), "lr": lr, "seconds": time.perf_counter() - started, "rows": records}
+            record = {
+                "step": step,
+                "loss": loss_sum,
+                "ce_loss": ce_loss_sum,
+                "kl_loss": kl_loss_sum,
+                "trained_blocks": trained_blocks_sum,
+                "trained_tokens": trained_tokens_sum,
+                "grad": float(norm),
+                "lr": lr,
+                "seconds": time.perf_counter() - started,
+                "rows": records,
+            }
             log.write(json.dumps(record) + "\n")
             log.flush()
             if step == 1 or step % 10 == 0:
