@@ -405,7 +405,11 @@ def diffusion_batch_step(
             else:
                 sub_tokens = view_tokens.index_select(0, active_idx)
                 sub_zero = zero_signal.index_select(0, active_idx)
-                sub_masks = {k: v.index_select(0, active_idx) for k, v in attn_masks.items()}
+                sub_masks = (
+                    {k: v.index_select(0, active_idx) for k, v in attn_masks.items()}
+                    if isinstance(attn_masks, dict)
+                    else attn_masks.index_select(0, active_idx)
+                )
                 sub_pos = position_ids.index_select(0, active_idx)
                 sub_hist_lens = [history_lengths[int(i)] for i in active_idx.tolist()]
             with torch.no_grad():
@@ -802,7 +806,11 @@ def diffusion_all_blocks_step(
         else:
             sub_tokens = tokens.index_select(0, active_idx)
             sub_zero = zero_signal.index_select(0, active_idx)
-            sub_masks = {k: v.index_select(0, active_idx) for k, v in attn_masks.items()}
+            sub_masks = (
+                {k: v.index_select(0, active_idx) for k, v in attn_masks.items()}
+                if isinstance(attn_masks, dict)
+                else attn_masks.index_select(0, active_idx)
+            )
             sub_pos = position_ids.index_select(0, active_idx)
         with torch.no_grad():
             first = _diffusion_forward(

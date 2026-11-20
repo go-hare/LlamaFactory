@@ -64,9 +64,12 @@ class DiffusionModelAdapter(Protocol):
 
 
 class StandardCausalAdapter:
-    """Adapter for standard GQA/Dense causal LMs (Qwen3, Llama, Mistral, etc.)."""
+    """Adapter for standard GQA/Dense causal LMs (Qwen3, Qwen2, Llama, Mistral, MiniCPM5, etc.)."""
 
     name = "standard_causal"
+
+    def __init__(self, *, dict_mask: bool = True):
+        self.dict_mask = bool(dict_mask)
 
     def embed_scale(self, model) -> float:
         del model
@@ -82,10 +85,12 @@ class StandardCausalAdapter:
         *,
         valid: torch.Tensor | None = None,
         sliding_window: int | None = None,
-    ) -> dict[str, torch.Tensor]:
+    ) -> dict[str, torch.Tensor] | torch.Tensor:
         del valid, sliding_window
-        # Passing a dict bypasses transformers' create_causal_mask override in Qwen3/Llama.
-        return {"full_attention": _additive_mask(allowed, dtype)}
+        mask = _additive_mask(allowed, dtype)
+        # Qwen3/Gemma hybrid models take a layer-type dict; Llama/MiniCPM5 take a raw 4D tensor
+        # which transformers' _preprocess_mask_arguments passes straight through unchanged.
+        return {"full_attention": mask} if self.dict_mask else mask
 
     @contextmanager
     def forward_context(self, model, tokens: torch.Tensor, signal: torch.Tensor, canvas_start: int, conditioner: nn.Module):
@@ -110,13 +115,14 @@ class StandardCausalAdapter:
         vocab = tokenizer.get_vocab() if hasattr(tokenizer, "get_vocab") else {}
         im_end = vocab.get("<|im_end|>")
         endoftext = vocab.get("<|endoftext|>")
-        pad_id = endoftext if isinstance(endoftext, int) else (tokenizer.pad_token_id or 0)
-        eos_id = im_end if isinstance(im_end, int) else (tokenizer.eos_token_id or 1)
+        raw_eos = getattr(tokenizer, "eos_token_id", None)
+        eos_list = [int(x) for x in raw_eos] if isinstance(raw_eos, (list, tuple)) else ([int(raw_eos)] if raw_eos is not None else [])
+        raw_pad = getattr(tokenizer, "pad_token_id", None)
+        pad_id = endoftext if isinstance(endoftext, int) else (int(raw_pad) if raw_pad is not None else 0)
+        eos_id = im_end if isinstance(im_end, int) else (eos_list[0] if eos_list else 1)
         if eos_id == pad_id:
             eos_id = 1 if pad_id != 1 else 2
-        stop_tokens = tuple(
-            sorted({int(x) for x in (eos_id, tokenizer.eos_token_id) if x is not None and int(x) != pad_id})
-        )
+        stop_tokens = tuple(sorted({int(x) for x in [eos_id, *eos_list] if int(x) != pad_id}))
         return int(pad_id), int(eos_id), stop_tokens or (int(eos_id),)
 
 
@@ -227,10 +233,10 @@ _ADAPTER_REGISTRY: dict[str, DiffusionModelAdapter] = {
     "gemma4_text": Gemma4Adapter(),
     "gemma3": Gemma4Adapter(),
     "gemma3_text": Gemma4Adapter(),
-    "qwen3": StandardCausalAdapter(),
-    "qwen2": StandardCausalAdapter(),
-    "llama": StandardCausalAdapter(),
-    "mistral": StandardCausalAdapter(),
+    "qwen3": StandardCausalAdapter(dict_mask=True),
+    "qwen2": StandardCausalAdapter(dict_mask=True),
+    "llama": StandardCausalAdapter(dict_mask=False),
+    "mistral": StandardCausalAdapter(dict_mask=False),
 }
 
 

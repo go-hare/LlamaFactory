@@ -70,11 +70,14 @@ def resolve_special_ids(tokenizer) -> tuple[int, int, tuple[int, ...]]:
     vocab = tokenizer.get_vocab() if hasattr(tokenizer, "get_vocab") else {}
     im_end = vocab.get("<|im_end|>")
     endoftext = vocab.get("<|endoftext|>")
-    pad_id = endoftext if isinstance(endoftext, int) else (tokenizer.pad_token_id or 0)
-    eos_id = im_end if isinstance(im_end, int) else (tokenizer.eos_token_id or 1)
+    raw_eos = getattr(tokenizer, "eos_token_id", None)
+    eos_list = [int(x) for x in raw_eos] if isinstance(raw_eos, (list, tuple)) else ([int(raw_eos)] if raw_eos is not None else [])
+    raw_pad = getattr(tokenizer, "pad_token_id", None)
+    pad_id = endoftext if isinstance(endoftext, int) else (int(raw_pad) if raw_pad is not None else 0)
+    eos_id = im_end if isinstance(im_end, int) else (eos_list[0] if eos_list else 1)
     if eos_id == pad_id:
         eos_id = 1 if pad_id != 1 else 2
-    stop_tokens = tuple(sorted({int(x) for x in (eos_id, tokenizer.eos_token_id) if x is not None and int(x) != pad_id}))
+    stop_tokens = tuple(sorted({int(x) for x in [eos_id, *eos_list] if int(x) != pad_id}))
     if not stop_tokens:
         stop_tokens = (eos_id,)
     return int(pad_id), int(eos_id), stop_tokens
@@ -119,11 +122,16 @@ class LazyQwen3Split:
             handle.seek(self.offsets[index])
             raw = json.loads(handle.readline().decode("utf-8"))
         q_prompt, q_response = gemma_to_qwen3_texts(raw["prompt"], raw["response"])
+        bos = getattr(self.tokenizer, "bos_token", None)
+        if isinstance(bos, str) and bos and not q_prompt.startswith(bos):
+            q_prompt = bos + q_prompt
         p_ids = self.tokenizer.encode(q_prompt, add_special_tokens=False)[: self.prompt_cap]
         r_ids = self.tokenizer.encode(q_response, add_special_tokens=False)[: self.response_cap]
         if not p_ids or not r_ids:
-            p_ids = p_ids or [self.tokenizer.bos_token_id or 151643]
-            r_ids = r_ids or [self.tokenizer.eos_token_id or 151645]
+            _, fallback_eos, _ = resolve_special_ids(self.tokenizer)
+            fallback_bos = getattr(self.tokenizer, "bos_token_id", None)
+            p_ids = p_ids or [int(fallback_bos) if fallback_bos is not None else 0]
+            r_ids = r_ids or [fallback_eos]
         return {
             "prompt": q_prompt,
             "response": q_response,
@@ -427,7 +435,11 @@ def arguments():
     parser.add_argument("--lr-scheduler", choices=["cosine", "constant"], default="cosine")
     parser.add_argument("--warmup-steps", type=int, default=50)
     parser.add_argument("--min-lr-ratio", type=float, default=0.1)
-    parser.add_argument("--optimizer-mode", choices=["auto", "fp32-master", "gpu-adamw"], default="auto")
+    parser.add_argument(
+        "--optimizer-mode",
+        choices=["auto", "fp32-master", "gpu-fp32-master", "gpu-adamw"],
+        default="auto",
+    )
     parser.add_argument("--training-mode", choices=["single-block", "all-blocks"], default="single-block")
     parser.add_argument("--max-train-blocks", type=int, default=6, help="Max contiguous blocks per row in all-blocks mode")
     parser.add_argument("--ar-teacher", type=str, default=None, help="Frozen AR teacher model for top-K soft-logit KL distillation")
@@ -504,6 +516,10 @@ def main():
         if not args.tiny:
             print("MASTER_MEMORY", require_master_memory(model), flush=True)
         optimizer = MasterAdamW(trainable_params, lr=args.lr, betas=(0.95, 0.99), weight_decay=1e-4)
+    elif opt_mode == "gpu-fp32-master":
+        from llamafactory.train.diffusion.precision import GpuMasterAdamW
+
+        optimizer = GpuMasterAdamW(trainable_params, lr=args.lr, betas=(0.95, 0.99), weight_decay=1e-4)
     else:
         optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, betas=(0.95, 0.99), weight_decay=1e-4, foreach=False)
 
