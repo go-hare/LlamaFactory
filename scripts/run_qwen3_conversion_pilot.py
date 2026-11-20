@@ -16,7 +16,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from safetensors.torch import load_file
-from transformers import AutoModelForCausalLM, AutoTokenizer, Qwen3Config, Qwen3ForCausalLM
+from transformers import AutoModelForCausalLM, Qwen3Config, Qwen3ForCausalLM
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,14 +24,17 @@ sys.path.insert(0, str(ROOT / "src"))
 from run_single_sample_controls import fresh_destination, load_model_weights, preflight, save_checkpoint, write_json
 from validate_diffusion_conversion import ByteTokenizer, preserve_rng
 
+from llamafactory.train.diffusion.adapter import get_diffusion_adapter, load_diffusion_backbone
 from llamafactory.train.diffusion.loss import (
+    DiffusionHistoryCache,
     _get_conditioner,
     denoise_logits,
     diffusion_all_blocks_step,
     diffusion_batch_step,
     prepare_conversion_training,
+    supports_history_kv_cache,
 )
-from llamafactory.train.diffusion.rl import sample_response
+from llamafactory.train.diffusion.rl import sample_canvas, sample_response
 
 
 _TURN_RE = re.compile(r"<\|turn>(system|user|model)\n(.*?)<turn\|>", re.DOTALL)
@@ -148,9 +151,138 @@ def load_qwen3_splits(directory: Path, tokenizer, *, prompt_cap: int = 4096, res
     }
 
 
+class LazyQwen3VLSplit:
+    """Lazy multimodal JSONL split for Qwen3-VL (image + text prompt -> ChatML response)."""
+
+    def __init__(
+        self,
+        path: Path,
+        processor,
+        *,
+        prompt_cap: int = 4096,
+        response_cap: int = 18 * 256,
+        max_image_side: int = 768,
+    ):
+        self.path = path
+        self.root_dir = path.parent
+        self.processor = processor
+        self.tokenizer = getattr(processor, "tokenizer", processor)
+        self.prompt_cap = prompt_cap
+        self.response_cap = response_cap
+        self.max_image_side = max_image_side
+        self.offsets: list[int] = []
+        with self.path.open("rb") as handle:
+            while True:
+                pos = handle.tell()
+                line = handle.readline()
+                if not line:
+                    break
+                if line.strip():
+                    self.offsets.append(pos)
+
+    def __len__(self) -> int:
+        return len(self.offsets)
+
+    def _open_image(self, ref: str):
+        from PIL import Image
+
+        p = Path(ref)
+        if not p.is_absolute():
+            p = self.root_dir / p
+        img = Image.open(p).convert("RGB")
+        if self.max_image_side > 0 and max(img.size) > self.max_image_side:
+            img.thumbnail((self.max_image_side, self.max_image_side))
+        return img
+
+    def __getitem__(self, index: int) -> dict:
+        with self.path.open("rb") as handle:
+            handle.seek(self.offsets[index])
+            raw = json.loads(handle.readline().decode("utf-8"))
+
+        img_refs = raw.get("images")
+        if img_refs is None and raw.get("image"):
+            img_refs = [raw["image"]]
+        img_refs = list(img_refs or [])
+        pil_images = [self._open_image(r) for r in img_refs]
+
+        user_text = str(raw.get("user") or raw.get("question") or raw.get("prompt") or "Describe this image.")
+        system_text = str(raw.get("system") or "")
+        messages: list[dict] = []
+        if system_text:
+            messages.append({"role": "system", "content": [{"type": "text", "text": system_text}]})
+        user_content = [{"type": "image", "image": img} for img in pil_images]
+        user_content.append({"type": "text", "text": user_text})
+        messages.append({"role": "user", "content": user_content})
+
+        encoded = self.processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+        )
+        p_ids = encoded["input_ids"][0].tolist()
+        if len(p_ids) > self.prompt_cap:
+            # Never truncate inside vision placeholder tokens if avoidable; keep full prefix if images fit.
+            p_ids = p_ids[: self.prompt_cap]
+
+        resp_raw = str(raw.get("response") or raw.get("answer") or "")
+        # Qwen3-VL-*-Thinking chat_template appends `<|im_start|>assistant\n<think>\n` to the prompt;
+        # keep <think>...</think> balanced for both CoT and direct-answer multimodal rows.
+        prompt_tail = self.tokenizer.decode(p_ids[-8:], skip_special_tokens=False)
+        if prompt_tail.rstrip().endswith("<think>"):
+            if resp_raw.startswith("<think>\n"):
+                resp_raw = resp_raw[len("<think>\n") :]
+            elif resp_raw.startswith("<think>"):
+                resp_raw = resp_raw[len("<think>") :].lstrip("\n")
+            elif "</think>" not in resp_raw:
+                resp_raw = f"</think>\n{resp_raw}"
+        if not resp_raw.endswith("<|im_end|>"):
+            resp_raw = f"{resp_raw}<|im_end|>"
+        r_ids = self.tokenizer.encode(resp_raw, add_special_tokens=False)[: self.response_cap]
+        if not r_ids:
+            _, fallback_eos, _ = resolve_special_ids(self.tokenizer)
+            r_ids = [fallback_eos]
+
+        mm = None
+        if encoded.get("pixel_values") is not None and encoded.get("image_grid_thw") is not None:
+            mm = {
+                "pixel_values": encoded["pixel_values"],
+                "image_grid_thw": encoded["image_grid_thw"],
+            }
+            if encoded.get("mm_token_type_ids") is not None:
+                mm["mm_token_type_ids"] = encoded["mm_token_type_ids"][0][: len(p_ids)]
+
+        return {
+            "prompt": f"[IMAGE:{','.join(str(x) for x in img_refs)}] {user_text}",
+            "response": resp_raw,
+            "prompt_ids": p_ids,
+            "response_ids": r_ids,
+            "bucket": int(raw.get("bucket", 0)),
+            "multimodal": mm,
+        }
+
+
+def load_vision_splits(directory: Path, processor, *, prompt_cap: int = 4096, response_cap: int = 18 * 256):
+    out = {}
+    for split in ("valid", "train"):
+        p = directory / f"{split}.jsonl"
+        if p.is_file():
+            out[split] = LazyQwen3VLSplit(p, processor, prompt_cap=prompt_cap, response_cap=response_cap)
+    return out
+
+
 def fixed_plan(splits, canvas: int):
     plan = {"recovery": [], "generation": []}
     for split, rows in splits.items():
+        if split.startswith("vision_"):
+            limit = min(len(rows), 8)
+            for idx in range(limit):
+                blocks = (len(rows[idx]["response_ids"]) + canvas - 1) // canvas
+                plan["recovery"].append({"split": split, "row": idx, "block": 0 if blocks <= 1 else (idx % blocks)})
+            for idx in range(min(len(rows), 2)):
+                plan["generation"].append({"split": split, "row": idx, "seed": 100})
+            continue
         probe_limit = min(len(rows), 256)
         probed = [(i, rows[i]) for i in range(probe_limit)]
         probed_map = dict(probed)
@@ -192,31 +324,69 @@ def tensor_row(row, device):
     )
 
 
-def sample_pilot_response(model, prompt, settings, *, pad_id: int, stop_tokens: tuple[int, ...]):
+def sample_pilot_response(
+    model,
+    prompt,
+    settings,
+    *,
+    pad_id: int,
+    stop_tokens: tuple[int, ...],
+    multimodal_input: dict | None = None,
+):
     started = time.perf_counter()
     chunks, history = [], prompt
     reason = "canvas_budget"
     stop_set = set(stop_tokens)
     vocab_size = int(getattr(getattr(model.config, "text_config", model.config), "vocab_size", 0) or model.config.vocab_size)
+    use_kv = bool(settings.get("use_kv_cache", True)) and supports_history_kv_cache(model)
+    rep_pen = float(settings.get("repetition_penalty", 1.0))
+    history_cache = None
+    if use_kv:
+        history_cache = DiffusionHistoryCache(model, pad_id=pad_id)
+        history_cache.prefill(prompt, multimodal_input=multimodal_input)
     for block in range(settings["generation_canvases"]):
         if chunks and time.perf_counter() - started >= settings.get("generation_seconds", 120):
             reason = "time_budget"
             break
-        chunk = sample_response(
-            model,
-            history,
-            steps=settings["sample_steps"],
-            canvas_size=settings["canvas"],
-            max_canvases=1,
-            pad_id=pad_id,
-            stop_tokens=stop_tokens,
-            vocab_size=vocab_size,
-            sampler=settings.get("sampler", "ddim"),
-            temperature=settings.get("sample_temperature", 0.7),
-            protect_stop_time=settings.get("protect_stop_time", 0.75),
-            mask_id=settings.get("mask_id"),
-            remask_eta=settings.get("remask_eta", 0.08),
-        )
+        if history_cache is not None:
+            canvas, _ = sample_canvas(
+                model,
+                history,
+                steps=settings["sample_steps"],
+                canvas_size=settings["canvas"],
+                pad_id=pad_id,
+                vocab_size=vocab_size,
+                sampler=settings.get("sampler", "ddim"),
+                temperature=settings.get("sample_temperature", 0.7),
+                protect_stop_tokens=stop_tokens if settings.get("protect_stop_time", 0.75) > 0 else (),
+                protect_stop_time=settings.get("protect_stop_time", 0.75),
+                mask_id=settings.get("mask_id"),
+                remask_eta=settings.get("remask_eta", 0.08),
+                history_cache=history_cache,
+                repetition_penalty=rep_pen,
+                exempt_tokens=stop_tokens,
+            )
+            row = canvas[0]
+            hit_idx = next((idx for idx, tid in enumerate(row.tolist()) if tid in stop_set), None)
+            chunk = row[: hit_idx + 1] if hit_idx is not None else row
+        else:
+            chunk = sample_response(
+                model,
+                history,
+                steps=settings["sample_steps"],
+                canvas_size=settings["canvas"],
+                max_canvases=1,
+                pad_id=pad_id,
+                stop_tokens=stop_tokens,
+                vocab_size=vocab_size,
+                sampler=settings.get("sampler", "ddim"),
+                temperature=settings.get("sample_temperature", 0.7),
+                protect_stop_time=settings.get("protect_stop_time", 0.75),
+                mask_id=settings.get("mask_id"),
+                remask_eta=settings.get("remask_eta", 0.08),
+                multimodal_input=multimodal_input,
+                repetition_penalty=rep_pen,
+            )
         chunks.append(chunk)
         print(
             "GENERATION_BLOCK",
@@ -230,7 +400,10 @@ def sample_pilot_response(model, prompt, settings, *, pad_id: int, stop_tokens: 
         if len(chunk) and int(chunk[-1]) in stop_set:
             reason = "stop_token"
             break
-        history = torch.cat([history, chunk])
+        if history_cache is not None:
+            history_cache.prefill(chunk)
+        else:
+            history = torch.cat([history, chunk])
     return torch.cat(chunks), reason
 
 
@@ -246,6 +419,7 @@ def evaluate(model, tokenizer, splits, plan, settings, out, step, generate, *, p
         for item in plan["recovery"]:
             row = splits[item["split"]][item["row"]]
             prompt, target = tensor_row(row, device)
+            mm_in = row.get("multimodal")
             begin = item["block"] * canvas
             body = target[begin : begin + canvas]
             clean = target.new_full((canvas,), eos_id)
@@ -259,7 +433,7 @@ def evaluate(model, tokenizer, splits, plan, settings, out, step, generate, *, p
                 else:
                     corrupt_fill = torch.randint(0, vocab, (canvas,), device=device)
                 noisy = torch.where(changed, corrupt_fill, clean)
-                logits = denoise_logits(model, history, noisy, pad_id=pad_id)[0]
+                logits = denoise_logits(model, history, noisy, pad_id=pad_id, multimodal_input=mm_in)[0]
                 ce = F.cross_entropy(logits.float(), clean, reduction="none")
                 correct = logits.argmax(-1) == clean
                 record = dict(item, bucket=row["bucket"], noise=noise)
@@ -280,9 +454,12 @@ def evaluate(model, tokenizer, splits, plan, settings, out, step, generate, *, p
             for item in plan["generation"]:
                 row = splits[item["split"]][item["row"]]
                 prompt = torch.tensor(row["prompt_ids"], dtype=torch.long, device=device)
+                mm_in = row.get("multimodal")
                 torch.manual_seed(item["seed"])
                 print("GENERATE_START", step, item, flush=True)
-                output, reason = sample_pilot_response(model, prompt, settings, pad_id=pad_id, stop_tokens=stop_tokens)
+                output, reason = sample_pilot_response(
+                    model, prompt, settings, pad_id=pad_id, stop_tokens=stop_tokens, multimodal_input=mm_in
+                )
                 raw_text = tokenizer.decode(output.tolist(), skip_special_tokens=False)
                 record = dict(
                     item,
@@ -351,19 +528,94 @@ def tiny_setup():
     return model, tokenizer, splits
 
 
-def apply_lora_if_requested(model, lora_rank: int):
+def tiny_vl_setup():
+    from transformers import Qwen3VLConfig, Qwen3VLForConditionalGeneration
+
+    tokenizer = ByteTokenizer()
+    tokenizer.eos_token_id = 1
+    img_tok = 250
+    cfg = Qwen3VLConfig(
+        text_config=dict(
+            vocab_size=259,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            tie_word_embeddings=True,
+            rope_scaling={"mrope_interleaved": True, "mrope_section": [2, 1, 1], "rope_type": "default"},
+        ),
+        vision_config=dict(
+            depth=2,
+            hidden_size=16,
+            intermediate_size=32,
+            num_heads=2,
+            out_hidden_size=16,
+            patch_size=4,
+            spatial_merge_size=2,
+            temporal_patch_size=2,
+            num_position_embeddings=16,
+            deepstack_visual_indexes=[0, 1],
+        ),
+        tie_word_embeddings=True,
+        image_token_id=img_tok,
+        video_token_id=251,
+        vision_start_token_id=248,
+        vision_end_token_id=249,
+    )
+    model = Qwen3VLForConditionalGeneration(cfg).to(torch.bfloat16)
+    splits = {}
+    for split in ("train", "valid"):
+        splits[split] = [
+            {
+                "prompt": f"{split}{i}",
+                "response": "x" * (i * 16 + 1),
+                "bucket": i,
+                "prompt_ids": tokenizer.encode(f"{split}{i}"),
+                "response_ids": tokenizer.encode("x" * (i * 16 + 1)) + [1],
+            }
+            for i in range(4)
+        ]
+    # Synthetic multimodal split (1 image of grid [1, 2, 2] -> 1 merged vision token per image)
+    patch_dim = 3 * 2 * 4 * 4  # in_channels * temporal_patch_size * patch_size^2
+    vision_rows = []
+    for i in range(4):
+        p_ids = [248, img_tok, 249] + tokenizer.encode(f"img{i}")
+        vision_rows.append(
+            {
+                "prompt": f"[IMAGE:synthetic_{i}] img{i}",
+                "response": "v" * (i * 8 + 4),
+                "bucket": i % 2,
+                "prompt_ids": p_ids,
+                "response_ids": tokenizer.encode("v" * (i * 8 + 4)) + [1],
+                "multimodal": {
+                    "pixel_values": torch.randn(4, patch_dim, dtype=torch.bfloat16),
+                    "image_grid_thw": torch.tensor([[1, 2, 2]], dtype=torch.long),
+                },
+            }
+        )
+    splits["vision_train"] = vision_rows
+    splits["vision_valid"] = vision_rows[:2]
+    return model, tokenizer, splits
+
+
+def apply_lora_if_requested(model, lora_rank: int, *, freeze_vision: bool = True):
     if lora_rank <= 0:
         return model
     from peft import LoraConfig, TaskType, get_peft_model
 
+    adapter = get_diffusion_adapter(model)
     lora_cfg = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
         r=lora_rank,
         lora_alpha=lora_rank * 2,
         lora_dropout=0.0,
-        target_modules="all-linear",
+        target_modules=adapter.lora_target_modules(model, freeze_vision=freeze_vision),
     )
     model = get_peft_model(model, lora_cfg)
+    if freeze_vision:
+        adapter.freeze_vision(model)
     # Keep the newly initialized SelfConditioner fully trainable alongside LoRA adapters.
     cond = _get_conditioner(model)
     for param in cond.parameters():
@@ -449,14 +701,22 @@ def arguments():
     parser.add_argument("--data-offset", type=int, default=0, help="Row schedule offset to skip previously trained rows")
     parser.add_argument("--init-self-conditioner", type=Path, default=None, help="Preload unwrapped SelfConditioner weights before LoRA")
     parser.add_argument("--cudnn-sdp", action="store_true", help="Prefer CUDNN SDPA over slower mem-efficient SDPA (Blackwell)")
+    parser.add_argument("--vision-data", type=Path, default=None, help="Optional multimodal JSONL directory (train.jsonl/valid.jsonl) to mix with text data")
+    parser.add_argument("--vision-ratio", type=float, default=0.25, help="Fraction of training rows sampled from --vision-data when provided")
+    parser.add_argument("--unfreeze-vision", action="store_true", help="Train vision encoder instead of keeping it frozen")
+    parser.add_argument("--no-kv-cache", action="store_true", help="Disable History KV Cache during generation evaluation")
+    parser.add_argument("--repetition-penalty", type=float, default=1.0, help="Local neighbor repetition penalty during sampling (>1.0 dampens comma runs)")
     parser.add_argument("--keep-checkpoints", type=int, default=2)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--tiny", action="store_true")
+    parser.add_argument("--tiny-vl", action="store_true", help="Run tiny synthetic multimodal Qwen3-VL end-to-end check")
     return parser.parse_args()
 
 
 def main():
     args = arguments()
+    is_tiny = bool(args.tiny or args.tiny_vl)
+    freeze_vision = not bool(args.unfreeze_vision)
     if args.cudnn_sdp and torch.cuda.is_available():
         torch.backends.cuda.enable_cudnn_sdp(True)
         torch.backends.cuda.enable_flash_sdp(True)
@@ -465,21 +725,34 @@ def main():
     if args.ar_teacher and args.kl_weight > 0.0 and args.training_mode != "all-blocks":
         raise ValueError("--ar-teacher with --kl-weight > 0 requires --training-mode all-blocks")
     fresh_destination(args.out)
-    hardware = preflight(args.tiny, args.out)
+    hardware = preflight(is_tiny, args.out)
     print("PREFLIGHT", hardware, flush=True)
 
     random.seed(42)
     torch.manual_seed(42)
-    if args.tiny:
+    processor = None
+    if args.tiny_vl:
+        model, tokenizer, splits = tiny_vl_setup()
+        adapter = get_diffusion_adapter(model)
+    elif args.tiny:
         model, tokenizer, splits = tiny_setup()
+        adapter = get_diffusion_adapter(model)
     else:
-        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        model, tokenizer, processor, adapter = load_diffusion_backbone(args.model, dtype=torch.bfloat16, device="cuda")
         splits = load_qwen3_splits(args.data, tokenizer)
-        model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16).cuda()
+        if args.vision_data is not None:
+            if processor is None:
+                raise RuntimeError(f"--vision-data requires a multimodal processor, but {args.model} loaded without one.")
+            v_splits = load_vision_splits(args.vision_data, processor)
+            if "train" in v_splits:
+                splits["vision_train"] = v_splits["train"]
+            if "valid" in v_splits:
+                splits["vision_valid"] = v_splits["valid"]
+            print("VISION_DATA_LOADED", {k: len(v) for k, v in v_splits.items()}, flush=True)
 
     ar_teacher = None
     if args.ar_teacher and args.kl_weight > 0.0 and not args.eval_only:
-        if args.tiny:
+        if is_tiny:
             ar_teacher, _, _ = tiny_setup()
             ar_teacher = ar_teacher.to(next(model.parameters()).device).eval()
         else:
@@ -488,7 +761,7 @@ def main():
             param.requires_grad_(False)
         print("AR_TEACHER_LOADED", {"model": args.ar_teacher, "kl_weight": args.kl_weight, "kl_topk": args.kl_topk, "kl_temp": args.kl_temp}, flush=True)
 
-    pad_id, eos_id, stop_tokens = resolve_special_ids(tokenizer)
+    pad_id, eos_id, stop_tokens = adapter.resolve_special_ids(tokenizer)
     vocab_size = int(getattr(getattr(model.config, "text_config", model.config), "vocab_size", 0) or model.config.vocab_size)
     mask_id = (
         int(args.mask_id)
@@ -496,10 +769,14 @@ def main():
         else resolve_mask_id(tokenizer, vocab_size, pad_id=pad_id, eos_id=eos_id)
     )
     prepare_conversion_training(model)
+    if freeze_vision:
+        frozen_vis = adapter.freeze_vision(model)
+        if frozen_vis > 0:
+            print("VISION_ENCODER_FROZEN", {"frozen_params": frozen_vis}, flush=True)
     if args.init_self_conditioner and not args.resume:
         _get_conditioner(model).load_state_dict(load_file(str(args.init_self_conditioner)), strict=True)
         print("INIT_SELF_CONDITIONER_LOADED", str(args.init_self_conditioner), flush=True)
-    model = apply_lora_if_requested(model, args.lora_rank)
+    model = apply_lora_if_requested(model, args.lora_rank, freeze_vision=freeze_vision)
     if hasattr(model, "enable_input_require_grads") and args.lora_rank > 0:
         model.enable_input_require_grads()
     if not args.no_grad_ckpt:
@@ -513,7 +790,7 @@ def main():
     if opt_mode == "fp32-master":
         from llamafactory.train.diffusion.precision import MasterAdamW, require_master_memory
 
-        if not args.tiny:
+        if not is_tiny:
             print("MASTER_MEMORY", require_master_memory(model), flush=True)
         optimizer = MasterAdamW(trainable_params, lr=args.lr, betas=(0.95, 0.99), weight_decay=1e-4)
     elif opt_mode == "gpu-fp32-master":
@@ -526,15 +803,17 @@ def main():
     settings = {
         k: str(v) if isinstance(v, Path) else v
         for k, v in vars(args).items()
-        if k not in ("out", "resume", "data", "keep_checkpoints", "eval_only")
+        if k not in ("out", "resume", "data", "vision_data", "keep_checkpoints", "eval_only")
     }
     settings.update(
-        canvas=16 if args.tiny else 256,
+        canvas=16 if is_tiny else 256,
         capacity=18,
         pad_id=pad_id,
         eos_id=eos_id,
         mask_id=mask_id,
         stop_tokens=list(stop_tokens),
+        use_kv_cache=not bool(args.no_kv_cache),
+        adapter=adapter.name,
         resolved_optimizer=opt_mode,
         trainable_params=sum(p.numel() for p in trainable_params),
         code_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
@@ -593,6 +872,8 @@ def main():
         with preserve_rng():
             evaluate(model, tokenizer, splits, plan, settings, args.out, 0, True, pad_id=pad_id, eos_id=eos_id, stop_tokens=stop_tokens)
 
+    vision_train = splits.get("vision_train")
+    vision_ratio = min(max(float(args.vision_ratio), 0.0), 1.0) if (vision_train and len(vision_train) > 0) else 0.0
     device = next(model.parameters()).device
     block_counts = Counter()
     resume_start = step
@@ -601,6 +882,8 @@ def main():
             started = time.perf_counter()
             step += 1
             model.train()
+            if freeze_vision:
+                adapter.freeze_vision(model)
             optimizer.zero_grad(set_to_none=True)
             lr = compute_lr(
                 step,
@@ -619,17 +902,30 @@ def main():
             effective_batch = max(1, args.grad_accum * args.micro_batch)
             step_items = []
             canvas = settings["canvas"]
+            n_vision_rows = int(round(effective_batch * vision_ratio)) if vision_ratio > 0.0 else 0
+            if vision_ratio > 0.0 and n_vision_rows == 0:
+                n_vision_rows = 1 if (step % max(1, int(round(1.0 / vision_ratio))) == 0) else 0
             for offset in range(effective_batch):
                 micro = (step - 1) * effective_batch + offset
-                index = schedule_index(micro + args.data_offset, len(splits["train"]))
-                prompt, target = tensor_row(splits["train"][index], device)
+                use_vision_row = vision_train is not None and offset < n_vision_rows
+                if use_vision_row:
+                    v_micro = (step - 1) * max(n_vision_rows, 1) + offset
+                    index = schedule_index(v_micro, len(vision_train), seed=1337)
+                    row_obj = vision_train[index]
+                    row_id = f"v:{index}"
+                else:
+                    index = schedule_index(micro + args.data_offset, len(splits["train"]))
+                    row_obj = splits["train"][index]
+                    row_id = index
+                prompt, target = tensor_row(row_obj, device)
+                mm_in = row_obj.get("multimodal")
                 if args.training_mode == "all-blocks":
                     n_active = min(max(1, (target.numel() + canvas - 1) // canvas), 18)
                     n_sel = min(n_active, max(1, args.max_train_blocks))
                     est_len = int(prompt.numel() + (n_active - 1) * canvas + n_sel * canvas)
                 else:
                     est_len = int(prompt.numel() + min(target.numel(), canvas * 18) // 2 + canvas)
-                step_items.append((micro, index, prompt, target, est_len))
+                step_items.append((micro, row_id, prompt, target, est_len, mm_in))
             if args.micro_batch > 1:
                 step_items.sort(key=lambda item: item[4])
             chunks: list[list[tuple]] = []
@@ -647,6 +943,8 @@ def main():
 
             for chunk in chunks:
                 torch.manual_seed(420000 + chunk[0][0])
+                chunk_mm = [c[5] for c in chunk]
+                mm_arg = chunk_mm if any(x is not None for x in chunk_mm) else None
                 if args.training_mode == "all-blocks":
                     loss, parts = diffusion_all_blocks_step(
                         model,
@@ -668,6 +966,7 @@ def main():
                         kl_topk=args.kl_topk,
                         kl_temp=args.kl_temp,
                         residual_mode=args.residual_mode,
+                        multimodal_inputs=mm_arg,
                     )
                     trained_blocks_sum += int(parts.get("trained_blocks", 0))
                     trained_tokens_sum += int(parts.get("trained_tokens", 0))
@@ -687,6 +986,7 @@ def main():
                         corruption_mode=args.corruption_mode,
                         mask_id=mask_id,
                         residual_mode=args.residual_mode,
+                        multimodal_inputs=mm_arg,
                     )
                     trained_blocks_sum += len(chunk)
                     trained_tokens_sum += len(chunk) * canvas

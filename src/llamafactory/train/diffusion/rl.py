@@ -19,7 +19,49 @@ import torch
 import torch.nn.functional as F
 
 from .adapter import get_diffusion_adapter
-from .loss import _embed_distribution, _token_embedding, denoise_step_logits, rcd_residual_signal
+from .loss import (
+    DiffusionHistoryCache,
+    _embed_distribution,
+    _token_embedding,
+    denoise_step_logits,
+    rcd_residual_signal,
+    supports_history_kv_cache,
+)
+
+
+def _apply_local_repetition_penalty(
+    logits: torch.Tensor,
+    canvas: torch.Tensor,
+    *,
+    penalty: float = 1.0,
+    exempt_tokens: tuple[int, ...] = (),
+) -> torch.Tensor:
+    """Dampen local token-run lock-in (e.g. `,,,,,` / `、、、、`) when a non-stop token repeats >=2x in +/-2 neighbors."""
+    if penalty <= 1.0 or canvas.shape[1] < 3:
+        return logits
+    bsz, length = canvas.shape
+    padded = torch.full((bsz, length + 4), -1, dtype=canvas.dtype, device=canvas.device)
+    padded[:, 2 : 2 + length] = canvas
+    m2, m1, p1, p2 = padded[:, :-4], padded[:, 1:-3], padded[:, 3:-1], padded[:, 4:]
+    pairs = [
+        (m1, (m1 >= 0) & ((m1 == m2) | (m1 == p1) | (m1 == p2))),
+        (p1, (p1 >= 0) & ((p1 == m2) | (p1 == p2)) & (p1 != m1)),
+        (m2, (m2 >= 0) & (m2 == p2) & (m2 != m1) & (m2 != p1)),
+    ]
+    out = logits.clone()
+    vocab = out.shape[-1]
+    for tok_ids, mask in pairs:
+        mask = mask & (tok_ids < vocab)
+        for ex in exempt_tokens:
+            mask = mask & (tok_ids != int(ex))
+        if not bool(mask.any()):
+            continue
+        safe_ids = tok_ids.clamp(min=0, max=vocab - 1).unsqueeze(-1)
+        cur = out.gather(-1, safe_ids).squeeze(-1)
+        penalized = torch.where(cur > 0, cur / penalty, cur * penalty)
+        updated = torch.where(mask, penalized, cur)
+        out.scatter_(-1, safe_ids, updated.unsqueeze(-1))
+    return out
 
 
 def _temperature(step: int, total: int, start: float = 0.8, end: float = 0.4, exponent: float = 1.0) -> float:
@@ -224,6 +266,11 @@ def sample_canvas(
     protect_stop_time: float = 0.0,
     mask_id: int | None = None,
     remask_eta: float = 0.08,
+    multimodal_input: dict | None = None,
+    history_cache: DiffusionHistoryCache | None = None,
+    use_kv_cache: bool = False,
+    repetition_penalty: float = 1.0,
+    exempt_tokens: tuple[int, ...] = (),
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Denoise one canvas from uniform noise or [MASK] prior with carried self-conditioning."""
     if sampler not in ("entropy", "ddim", "mask", "remdm", "rcd"):
@@ -243,14 +290,42 @@ def sample_canvas(
     sc_embeddings = torch.zeros(1, canvas_size, hidden_size, device=prompt.device, dtype=token_embedding.weight.dtype)
     mean_entropy = torch.zeros((), device=prompt.device)
     ddim_times = torch.linspace(1.0 - 1e-6, 0.0, steps + 1, device=prompt.device) if sampler in ("ddim", "remdm", "rcd") else None
+    active_cache = history_cache
+    if active_cache is None and use_kv_cache and supports_history_kv_cache(model):
+        active_cache = DiffusionHistoryCache(model, pad_id=pad_id)
+        active_cache.prefill(prompt, multimodal_input=multimodal_input)
+    rep_exempt = tuple({int(pad_id), *(int(t) for t in protect_stop_tokens), *(int(t) for t in exempt_tokens)})
+    temp_scale = max(float(temperature), 1e-4) / 0.7
     for step in range(steps):
         is_final_step = (step + 1) >= steps
-        logits = denoise_step_logits(model, prompt, canvas[0], sc_embeddings=sc_embeddings, pad_id=pad_id)
+        if active_cache is not None:
+            logits = active_cache.denoise_step_logits(canvas[0], sc_embeddings=sc_embeddings)
+        elif multimodal_input is not None:
+            logits = denoise_step_logits(
+                model,
+                prompt,
+                canvas[0],
+                sc_embeddings=sc_embeddings,
+                pad_id=pad_id,
+                multimodal_input=multimodal_input,
+            )
+        else:
+            logits = denoise_step_logits(
+                model,
+                prompt,
+                canvas[0],
+                sc_embeddings=sc_embeddings,
+                pad_id=pad_id,
+            )
+        if repetition_penalty > 1.0:
+            logits = _apply_local_repetition_penalty(
+                logits, canvas, penalty=repetition_penalty, exempt_tokens=rep_exempt
+            )
         if sampler == "entropy":
             next_canvas, shaped_logits, token_entropy = _commit(
                 logits,
                 canvas,
-                temperature=_temperature(step, steps),
+                temperature=_temperature(step, steps, start=0.8 * temp_scale, end=0.4 * temp_scale),
                 entropy_bound=0.1,
                 vocab_size=vocab_size,
                 is_final_step=is_final_step,
@@ -327,11 +402,18 @@ def sample_response(
     protect_stop_time: float = 0.0,
     mask_id: int | None = None,
     remask_eta: float = 0.08,
+    multimodal_input: dict | None = None,
+    use_kv_cache: bool = False,
+    repetition_penalty: float = 1.0,
 ) -> torch.Tensor:
     """Block-autoregressive generation across canvases, truncating at the first stop token."""
     running_prompt = prompt.view(-1)
     chunks: list[torch.Tensor] = []
     stop_set = set(stop_tokens)
+    history_cache = None
+    if use_kv_cache and supports_history_kv_cache(model):
+        history_cache = DiffusionHistoryCache(model, pad_id=pad_id)
+        history_cache.prefill(running_prompt, multimodal_input=multimodal_input)
     for _ in range(max_canvases):
         canvas, _ = sample_canvas(
             model,
@@ -347,6 +429,10 @@ def sample_response(
             protect_stop_time=protect_stop_time,
             mask_id=mask_id,
             remask_eta=remask_eta,
+            multimodal_input=multimodal_input if history_cache is None else None,
+            history_cache=history_cache,
+            repetition_penalty=repetition_penalty,
+            exempt_tokens=stop_tokens,
         )
         row = canvas[0]
         hit_idx = None
@@ -358,7 +444,10 @@ def sample_response(
             chunks.append(row[: hit_idx + 1])
             break
         chunks.append(row)
-        running_prompt = torch.cat([running_prompt, row], dim=0)
+        if history_cache is not None:
+            history_cache.prefill(row)
+        else:
+            running_prompt = torch.cat([running_prompt, row], dim=0)
     return torch.cat(chunks, dim=0) if chunks else running_prompt.new_zeros((0,))
 
 

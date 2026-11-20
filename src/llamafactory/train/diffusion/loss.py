@@ -196,11 +196,14 @@ def _diffusion_forward(
     position_ids,
     *,
     logits_to_keep: int | None = None,
+    model_kwargs: dict | None = None,
 ):
     """Delegate model-specific embedding/PLE/hook behavior to the resolved ``DiffusionModelAdapter``."""
     conditioner = _get_conditioner(model)
     adapter = get_diffusion_adapter(model)
     extra = {"logits_to_keep": int(logits_to_keep)} if (logits_to_keep is not None and _supports_logits_to_keep(model)) else {}
+    if model_kwargs:
+        extra.update(model_kwargs)
     with adapter.forward_context(model, tokens, signal, canvas_start, conditioner):
         return model(
             input_ids=tokens,
@@ -288,6 +291,7 @@ def diffusion_batch_step(
     complementary_mask: bool = False,
     residual_mode: str = "standard",
     ref_model=None,
+    multimodal_inputs: list[dict | None] | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """Batched section-4 conversion step across ``B`` rows in two forward passes."""
     if not prompts:
@@ -313,6 +317,7 @@ def diffusion_batch_step(
     current_valids: list[torch.Tensor] = []
     current_corrupted: list[torch.Tensor] = []
     sample_times: list[float] = []
+    selected_offsets: list[int] = []
     diagnostic_rows = []
     body_lengths = []
 
@@ -337,6 +342,7 @@ def diffusion_batch_step(
         num_valid = canvas_mask[first_indices].sum().clamp(min=1)
         selected_i = int((torch.rand((), device=device) * num_valid).long().item())
         prefix_len = selected_i * canvas_size
+        selected_offsets.append(prefix_len)
         body_lengths.append(max(0, min(canvas_size, r.numel() - prefix_len)))
         if diagnostics:
             diagnostic_rows.append(dict(
@@ -364,10 +370,23 @@ def diffusion_batch_step(
         decoder_tokens[b, :hlen] = history_seqs[b]
         history_valid_batch[b, :hlen] = history_valids[b]
 
+    adapter = get_diffusion_adapter(model)
     current_valid_batch = torch.stack(current_valids, dim=0)
     target_batch = torch.stack(current_targets, dim=0)
     valid_batch = torch.cat([history_valid_batch, current_valid_batch], dim=1)
     position_ids = (valid_batch.long().cumsum(dim=-1) - 1).clamp(min=0)
+    position_ids = adapter.build_position_ids(
+        model,
+        prompts,
+        multimodal_inputs,
+        position_ids,
+        clean_lengths=history_lengths,
+        canvas_start=max_hist,
+        noisy_start_offsets=selected_offsets,
+        noisy_lengths=[canvas_size] * batch_size,
+        pad_id=pad_id,
+    )
+    mm_batch = adapter.prepare_multimodal_batch(model, multimodal_inputs, device)
 
     total = max_hist + canvas_size
     allowed = torch.zeros((batch_size, 1, total, total), dtype=torch.bool, device=device)
@@ -377,7 +396,6 @@ def diffusion_batch_step(
     allowed[:, :, max_hist:, :] = full_canvas_allow[:, :, max_hist:, :]
     attn_masks = _gemma_masks(allowed, model_dtype, valid=valid_batch, sliding_window=window, model=model)
 
-    adapter = get_diffusion_adapter(model)
     zero_signal = torch.zeros((batch_size, canvas_size, hidden_size), device=device, dtype=model_dtype)
 
     def _run_view_loss(
@@ -402,6 +420,7 @@ def diffusion_batch_step(
                 sub_masks = attn_masks
                 sub_pos = position_ids
                 sub_hist_lens = history_lengths
+                sub_mm_kwargs = mm_batch.kwargs_for_rows(None, allow_grad=False)
             else:
                 sub_tokens = view_tokens.index_select(0, active_idx)
                 sub_zero = zero_signal.index_select(0, active_idx)
@@ -410,11 +429,19 @@ def diffusion_batch_step(
                     if isinstance(attn_masks, dict)
                     else attn_masks.index_select(0, active_idx)
                 )
-                sub_pos = position_ids.index_select(0, active_idx)
+                sub_pos = adapter.select_batch_positions(position_ids, active_idx)
                 sub_hist_lens = [history_lengths[int(i)] for i in active_idx.tolist()]
+                sub_mm_kwargs = mm_batch.kwargs_for_rows(active_idx.tolist(), allow_grad=False)
             with torch.no_grad():
                 first = _diffusion_forward(
-                    ref, sub_tokens, sub_zero, max_hist, sub_masks, sub_pos, logits_to_keep=ref_keep
+                    ref,
+                    sub_tokens,
+                    sub_zero,
+                    max_hist,
+                    sub_masks,
+                    sub_pos,
+                    logits_to_keep=ref_keep,
+                    model_kwargs=sub_mm_kwargs,
                 )
             first_logits = (
                 first.logits
@@ -438,8 +465,16 @@ def diffusion_batch_step(
                 signal.index_copy_(0, active_idx, embedded_first)
 
         dec_keep = canvas_size if (not token_shift and _supports_logits_to_keep(model)) else None
+        dec_mm_kwargs = mm_batch.kwargs_for_rows(None, allow_grad=True)
         decoder = _diffusion_forward(
-            model, view_tokens, signal, max_hist, attn_masks, position_ids, logits_to_keep=dec_keep
+            model,
+            view_tokens,
+            signal,
+            max_hist,
+            attn_masks,
+            position_ids,
+            logits_to_keep=dec_keep,
+            model_kwargs=dec_mm_kwargs,
         )
         current_logits = (
             decoder.logits
@@ -637,6 +672,7 @@ def diffusion_all_blocks_step(
     kl_temp: float = 1.0,
     residual_mode: str = "standard",
     ref_model=None,
+    multimodal_inputs: list[dict | None] | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """Multi-block parallel section-4 conversion step with optional frozen AR-teacher top-K KL distillation.
 
@@ -783,6 +819,19 @@ def diffusion_all_blocks_step(
         noisy_valid_batch[b, :nlen] = noisy_valids[b]
         position_ids[b, max_clean : max_clean + nlen] = noisy_pos_lists[b]
 
+    position_ids = adapter.build_position_ids(
+        model,
+        prompts,
+        multimodal_inputs,
+        position_ids,
+        clean_lengths=[seq.numel() for seq in clean_prefix_seqs],
+        canvas_start=max_clean,
+        noisy_start_offsets=[s_blk * canvas_size for s_blk in start_blocks],
+        noisy_lengths=[seq.numel() for seq in noisy_seqs],
+        pad_id=pad_id,
+    )
+    mm_batch = adapter.prepare_multimodal_batch(model, multimodal_inputs, device)
+
     allowed = _build_all_blocks_mask(
         clean_valid_batch,
         noisy_valid_batch,
@@ -803,6 +852,7 @@ def diffusion_all_blocks_step(
         active_idx = use_signal.view(-1).nonzero(as_tuple=False).flatten()
         if active_idx.numel() == batch_size:
             sub_tokens, sub_zero, sub_masks, sub_pos = tokens, zero_signal, attn_masks, position_ids
+            sub_mm_kwargs = mm_batch.kwargs_for_rows(None, allow_grad=False)
         else:
             sub_tokens = tokens.index_select(0, active_idx)
             sub_zero = zero_signal.index_select(0, active_idx)
@@ -811,10 +861,18 @@ def diffusion_all_blocks_step(
                 if isinstance(attn_masks, dict)
                 else attn_masks.index_select(0, active_idx)
             )
-            sub_pos = position_ids.index_select(0, active_idx)
+            sub_pos = adapter.select_batch_positions(position_ids, active_idx)
+            sub_mm_kwargs = mm_batch.kwargs_for_rows(active_idx.tolist(), allow_grad=False)
         with torch.no_grad():
             first = _diffusion_forward(
-                ref, sub_tokens, sub_zero, max_clean, sub_masks, sub_pos, logits_to_keep=ref_keep
+                ref,
+                sub_tokens,
+                sub_zero,
+                max_clean,
+                sub_masks,
+                sub_pos,
+                logits_to_keep=ref_keep,
+                model_kwargs=sub_mm_kwargs,
             )
         first_logits = first.logits if ref_keep is not None else first.logits[:, max_clean:]
         if residual_mode == "rcd":
@@ -834,8 +892,16 @@ def diffusion_all_blocks_step(
             signal.index_copy_(0, active_idx, embedded_first)
 
     dec_keep = max_noisy if _supports_logits_to_keep(model) else None
+    dec_mm_kwargs = mm_batch.kwargs_for_rows(None, allow_grad=True)
     decoder = _diffusion_forward(
-        model, tokens, signal, max_clean, attn_masks, position_ids, logits_to_keep=dec_keep
+        model,
+        tokens,
+        signal,
+        max_clean,
+        attn_masks,
+        position_ids,
+        logits_to_keep=dec_keep,
+        model_kwargs=dec_mm_kwargs,
     )
     noisy_logits = decoder.logits if dec_keep is not None else decoder.logits[:, max_clean:]
 
@@ -971,6 +1037,7 @@ def denoise_step_logits(
     sc_embeddings: torch.Tensor,
     pad_id: int,
     token_shift: bool = False,
+    multimodal_input: dict | None = None,
 ) -> torch.Tensor:
     """Single decoder forward pass with carried self-conditioning embeddings ``sc_embeddings``."""
     prompt = prompt.view(1, -1)
@@ -989,24 +1056,136 @@ def denoise_step_logits(
     allowed[:, :, history_len:, :] = canvas_rows[:, :, history_len:, :]
     tokens = torch.cat([prompt, canvas], dim=1)
     valid = torch.cat([prompt_valid, canvas_valid], dim=1)
-    conditioner = _get_conditioner(model)
     token_embedding = _token_embedding(model)
     model_dtype = token_embedding.weight.dtype
     signal = sc_embeddings.to(device=tokens.device, dtype=model_dtype)
 
     position_ids = (valid.long().cumsum(dim=-1) - 1).clamp(min=0)
+    adapter = get_diffusion_adapter(model)
+    mm_kwargs: dict = {}
+    if multimodal_input is not None:
+        position_ids = adapter.build_position_ids(
+            model,
+            [prompt[0]],
+            [multimodal_input],
+            position_ids,
+            clean_lengths=[history_len],
+            canvas_start=history_len,
+            noisy_start_offsets=[0],
+            noisy_lengths=[canvas.shape[1]],
+            pad_id=pad_id,
+        )
+        mm_batch = adapter.prepare_multimodal_batch(model, [multimodal_input], tokens.device)
+        mm_kwargs = mm_batch.kwargs_for_rows(None, allow_grad=False)
     keep = canvas.shape[1] if (not token_shift and _supports_logits_to_keep(model)) else None
     out = _diffusion_forward(
-        model, tokens, signal, history_len,
+        model,
+        tokens,
+        signal,
+        history_len,
         _gemma_masks(allowed, model_dtype, valid=valid, sliding_window=window, model=model),
         position_ids,
         logits_to_keep=keep,
+        model_kwargs=mm_kwargs,
     )
     if keep is not None:
         return out.logits
     return _extract_canvas_logits(
         out.logits, [history_len], history_len, canvas.shape[1], token_shift=token_shift
     )
+
+
+def supports_history_kv_cache(model) -> bool:
+    """Delegate KV-cache eligibility check to the model's ``DiffusionModelAdapter``."""
+    return get_diffusion_adapter(model).supports_history_kv_cache(model)
+
+
+class DiffusionHistoryCache:
+    """Model-agnostic causal KV cache over clean prefix/history for O(1)-history denoising steps."""
+
+    def __init__(self, model, *, pad_id: int):
+        from transformers import DynamicCache
+
+        self.model = model
+        self.adapter = get_diffusion_adapter(model)
+        self.pad_id = int(pad_id)
+        self.past_key_values = DynamicCache()
+        self.history_valid: torch.Tensor | None = None
+        self._pos_state: dict = {}
+
+    @property
+    def seq_length(self) -> int:
+        return int(self.past_key_values.get_seq_length())
+
+    @torch.no_grad()
+    def prefill(self, tokens: torch.Tensor, *, multimodal_input: dict | None = None) -> None:
+        """Append clean causal tokens (optionally multimodal) into the KV cache."""
+        tokens_2d = tokens.view(1, -1)
+        seq_len = int(tokens_2d.shape[1])
+        if seq_len == 0:
+            return
+        device = tokens_2d.device
+        valid_2d = tokens_2d != self.pad_id
+        past_len = self.seq_length
+        hist_valid = valid_2d if self.history_valid is None else torch.cat([self.history_valid, valid_2d], dim=1)
+
+        allowed = torch.zeros((1, 1, seq_len, past_len + seq_len), dtype=torch.bool, device=device)
+        if past_len > 0:
+            allowed[:, :, :, :past_len] = self.history_valid[:, None, None, :]
+        q = torch.arange(seq_len, device=device)[:, None]
+        k = torch.arange(seq_len, device=device)[None, :]
+        allowed[:, 0, :, past_len:] = (q >= k)[None, :, :] & valid_2d[:, None, :]
+
+        model_dtype = _token_embedding(self.model).weight.dtype
+        attn_mask = self.adapter.build_attention_mask(allowed, model_dtype)
+        pos, mm_kwargs = self.adapter.build_cache_prefill_inputs(
+            self.model, tokens_2d, valid_2d, multimodal_input, self._pos_state
+        )
+
+        extra = {"logits_to_keep": 1} if _supports_logits_to_keep(self.model) else {}
+        extra.update(mm_kwargs)
+        self.model(
+            input_ids=tokens_2d,
+            attention_mask=attn_mask,
+            position_ids=pos,
+            past_key_values=self.past_key_values,
+            use_cache=True,
+            **extra,
+        )
+        self.history_valid = hist_valid
+
+    def denoise_step_logits(self, canvas: torch.Tensor, *, sc_embeddings: torch.Tensor) -> torch.Tensor:
+        """Denoise one bidirectional canvas against the cached history without mutating the cache."""
+        if self.history_valid is None:
+            raise RuntimeError("DiffusionHistoryCache must be prefilled before denoise_step_logits.")
+        canvas_2d = canvas.view(1, -1)
+        canvas_len = int(canvas_2d.shape[1])
+        device = canvas_2d.device
+        past_len = self.seq_length
+
+        allowed = torch.ones((1, 1, canvas_len, past_len + canvas_len), dtype=torch.bool, device=device)
+        allowed[:, :, :, :past_len] = self.history_valid[:, None, None, :]
+
+        model_dtype = _token_embedding(self.model).weight.dtype
+        conditioner = _get_conditioner(self.model)
+        attn_mask = self.adapter.build_attention_mask(allowed, model_dtype)
+        pos = self.adapter.build_cache_canvas_positions(canvas_len, device, self._pos_state)
+
+        signal = sc_embeddings.to(device=device, dtype=model_dtype)
+        try:
+            with self.adapter.forward_context(self.model, canvas_2d, signal, 0, conditioner):
+                out = self.model(
+                    input_ids=canvas_2d,
+                    attention_mask=attn_mask,
+                    position_ids=pos,
+                    past_key_values=self.past_key_values,
+                    use_cache=True,
+                )
+        finally:
+            to_remove = self.seq_length - past_len
+            if to_remove > 0:
+                self.past_key_values.crop(-to_remove)
+        return out.logits
 
 
 def denoise_logits(
@@ -1016,18 +1195,39 @@ def denoise_logits(
     *,
     pad_id: int,
     token_shift: bool = False,
+    multimodal_input: dict | None = None,
 ) -> torch.Tensor:
     """Two-pass convenience wrapper when no prior ``sc_embeddings`` are carried."""
     text_config = getattr(model.config, "text_config", model.config)
     hidden_size = int(getattr(text_config, "hidden_size", 0) or model.config.hidden_size)
     canvas_len = canvas.numel()
     zero_sc = torch.zeros(1, canvas_len, hidden_size, device=prompt.device, dtype=_token_embedding(model).weight.dtype)
+    if multimodal_input is not None and supports_history_kv_cache(model):
+        cache = DiffusionHistoryCache(model, pad_id=pad_id)
+        cache.prefill(prompt, multimodal_input=multimodal_input)
+        with torch.no_grad():
+            first_logits = cache.denoise_step_logits(canvas, sc_embeddings=zero_sc)
+        adapter = get_diffusion_adapter(model)
+        signal = _embed_distribution(_token_embedding(model), first_logits, scale=adapter.embed_scale(model))
+        return cache.denoise_step_logits(canvas, sc_embeddings=signal)
     with torch.no_grad():
         first_logits = denoise_step_logits(
-            model, prompt, canvas, sc_embeddings=zero_sc, pad_id=pad_id, token_shift=token_shift
+            model,
+            prompt,
+            canvas,
+            sc_embeddings=zero_sc,
+            pad_id=pad_id,
+            token_shift=token_shift,
+            multimodal_input=multimodal_input,
         )
     adapter = get_diffusion_adapter(model)
     signal = _embed_distribution(_token_embedding(model), first_logits, scale=adapter.embed_scale(model))
     return denoise_step_logits(
-        model, prompt, canvas, sc_embeddings=signal, pad_id=pad_id, token_shift=token_shift
+        model,
+        prompt,
+        canvas,
+        sc_embeddings=signal,
+        pad_id=pad_id,
+        token_shift=token_shift,
+        multimodal_input=multimodal_input,
     )
