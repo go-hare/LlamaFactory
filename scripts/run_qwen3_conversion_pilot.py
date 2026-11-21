@@ -340,6 +340,8 @@ def sample_pilot_response(
     vocab_size = int(getattr(getattr(model.config, "text_config", model.config), "vocab_size", 0) or model.config.vocab_size)
     use_kv = bool(settings.get("use_kv_cache", True)) and supports_history_kv_cache(model)
     rep_pen = float(settings.get("repetition_penalty", 1.0))
+    defer_dup = bool(settings.get("defer_adjacent_dup", False))
+    gen_canvas = int(settings.get("eval_canvas") or 0) or int(settings["canvas"])
     history_cache = None
     if use_kv:
         history_cache = DiffusionHistoryCache(model, pad_id=pad_id)
@@ -353,7 +355,7 @@ def sample_pilot_response(
                 model,
                 history,
                 steps=settings["sample_steps"],
-                canvas_size=settings["canvas"],
+                canvas_size=gen_canvas,
                 pad_id=pad_id,
                 vocab_size=vocab_size,
                 sampler=settings.get("sampler", "ddim"),
@@ -365,6 +367,7 @@ def sample_pilot_response(
                 history_cache=history_cache,
                 repetition_penalty=rep_pen,
                 exempt_tokens=stop_tokens,
+                defer_adjacent_duplicates=defer_dup,
             )
             row = canvas[0]
             hit_idx = next((idx for idx, tid in enumerate(row.tolist()) if tid in stop_set), None)
@@ -374,7 +377,7 @@ def sample_pilot_response(
                 model,
                 history,
                 steps=settings["sample_steps"],
-                canvas_size=settings["canvas"],
+                canvas_size=gen_canvas,
                 max_canvases=1,
                 pad_id=pad_id,
                 stop_tokens=stop_tokens,
@@ -386,6 +389,7 @@ def sample_pilot_response(
                 remask_eta=settings.get("remask_eta", 0.08),
                 multimodal_input=multimodal_input,
                 repetition_penalty=rep_pen,
+                defer_adjacent_duplicates=defer_dup,
             )
         chunks.append(chunk)
         print(
@@ -674,7 +678,7 @@ def arguments():
     parser.add_argument("--corruption-mode", choices=["uniform", "mask"], default="uniform")
     parser.add_argument(
         "--loss-mode",
-        choices=["canvas-mean", "corrupted-only", "corrupted-only-weighted", "body-tail-balanced"],
+        choices=["canvas-mean", "tail-capped", "corrupted-only", "corrupted-only-weighted", "body-tail-balanced"],
         default="canvas-mean",
     )
     parser.add_argument("--time-min", type=float, default=None)
@@ -706,6 +710,8 @@ def arguments():
     parser.add_argument("--unfreeze-vision", action="store_true", help="Train vision encoder instead of keeping it frozen")
     parser.add_argument("--no-kv-cache", action="store_true", help="Disable History KV Cache during generation evaluation")
     parser.add_argument("--repetition-penalty", type=float, default=1.0, help="Local neighbor repetition penalty during sampling (>1.0 dampens comma runs)")
+    parser.add_argument("--defer-adjacent-dup", action="store_true", help="Defer same-step adjacent duplicate commits by 1 step to eliminate parallel stuttering")
+    parser.add_argument("--eval-canvas", type=int, default=0, help="Optional smaller canvas size during generation eval (e.g. 64 or 128; 0 = training canvas)")
     parser.add_argument("--keep-checkpoints", type=int, default=2)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--tiny", action="store_true")

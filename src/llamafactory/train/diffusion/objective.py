@@ -180,6 +180,45 @@ class BodyTailBalancedObjective:
         return torch.stack(terms).mean()
 
 
+class TailCappedObjective:
+    """Cap excess EOS-tail weight on short responses without ever amplifying tiny tails.
+
+    Each valid body token keeps weight ``1.0``; each valid tail token gets
+    ``min(1.0, max_tail_ratio * n_body / n_tail)``. Thus long blocks with short tails
+    match ``canvas-mean`` identically, while short VQA blocks do not drown body gradients
+    in 200+ repeated EOS tokens.
+    """
+
+    name = "tail-capped"
+
+    def __init__(self, *, max_tail_ratio: float = 0.25):
+        self.max_tail_ratio = float(max_tail_ratio)
+
+    def compute(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        valid: torch.Tensor,
+        corrupted: torch.Tensor,
+        *,
+        body_tokens: int,
+        time: float,
+    ) -> torch.Tensor:
+        del corrupted, time
+        body = (torch.arange(len(targets), device=targets.device) < body_tokens) & valid
+        tail = (~body) & valid
+        n_body = int(body.sum().item())
+        n_tail = int(tail.sum().item())
+        if n_body == 0 or n_tail == 0:
+            return F.cross_entropy(logits[valid], targets[valid])
+        tail_weight = min(1.0, (self.max_tail_ratio * n_body) / float(n_tail))
+        if tail_weight >= 1.0 - 1e-9:
+            return F.cross_entropy(logits[valid], targets[valid])
+        ce = F.cross_entropy(logits[valid], targets[valid], reduction="none")
+        weights = torch.where(body[valid], torch.ones_like(ce), torch.full_like(ce, tail_weight))
+        return (ce * weights).sum() / weights.sum().clamp_min(1e-6)
+
+
 def resolve_corruption(spec: str | CorruptionProcess | None, *, mask_id: int | None = None) -> CorruptionProcess:
     if spec is None or spec == "uniform":
         return UniformNoiseCorruption()
@@ -197,6 +236,8 @@ def resolve_objective(spec: str | DiffusionObjective | None) -> DiffusionObjecti
         return CanvasMeanObjective()
     if spec == "body-tail-balanced":
         return BodyTailBalancedObjective()
+    if spec == "tail-capped":
+        return TailCappedObjective()
     if spec == "corrupted-only":
         return CorruptedOnlyObjective(time_weight=False)
     if spec == "corrupted-only-weighted":

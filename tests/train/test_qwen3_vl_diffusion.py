@@ -24,7 +24,8 @@ from llamafactory.train.diffusion.loss import (
     prepare_conversion_training,
     supports_history_kv_cache,
 )
-from llamafactory.train.diffusion.rl import _apply_local_repetition_penalty, sample_canvas, sample_response
+from llamafactory.train.diffusion.objective import CanvasMeanObjective, TailCappedObjective, resolve_objective
+from llamafactory.train.diffusion.rl import _apply_local_repetition_penalty, _commit, sample_canvas, sample_response
 
 
 IMG_TOK = 60
@@ -314,6 +315,89 @@ def test_entropy_local_repetition_penalty_and_temperature_scaling():
     assert seen_temps[0] == pytest.approx(0.4)
 
 
+def test_tail_capped_objective_balances_short_vqa_without_amplifying_short_tails():
+    obj_cap = resolve_objective("tail-capped")
+    assert isinstance(obj_cap, TailCappedObjective)
+    obj_mean = CanvasMeanObjective()
+
+    # Case 1: Long text block (240 body, 16 tail) -> 0.25*240/16 = 3.75 >= 1.0 -> IDENTICAL to canvas-mean!
+    torch.manual_seed(0)
+    logits = torch.randn(256, 32)
+    targets = torch.randint(0, 32, (256,))
+    valid = torch.ones(256, dtype=torch.bool)
+    corrupted = torch.ones(256, dtype=torch.bool)
+    loss_cap = obj_cap.compute(logits, targets, valid, corrupted, body_tokens=240, time=0.5)
+    loss_mean = obj_mean.compute(logits, targets, valid, corrupted, body_tokens=240, time=0.5)
+    torch.testing.assert_close(loss_cap, loss_mean, atol=1e-6, rtol=1e-6)
+
+    # Case 2: Short vision VQA block (32 body, 224 easy EOS tail) -> body keeps 80% total weight, not 12.5%!
+    logits_v = torch.zeros(256, 32)
+    targets_v = torch.ones(256, dtype=torch.long)
+    # Tail positions predict target with near-zero CE; body positions have uniform CE = log(32) ~= 3.4657.
+    logits_v[32:, 1] = 30.0
+    loss_v_cap = obj_cap.compute(logits_v, targets_v, valid, corrupted, body_tokens=32, time=0.5)
+    loss_v_mean = obj_mean.compute(logits_v, targets_v, valid, corrupted, body_tokens=32, time=0.5)
+    body_ce = float(torch.log(torch.tensor(32.0)))
+    assert float(loss_v_mean) == pytest.approx(body_ce * (32.0 / 256.0), rel=1e-3)
+    # Tail total weight capped to 0.25 * 32 = 8 -> body share = 32 / (32 + 8) = 0.80!
+    assert float(loss_v_cap) == pytest.approx(body_ce * 0.80, rel=1e-3)
+
+
+def test_entropy_defer_adjacent_duplicates_breaks_stutter_and_keeps_true_reduplication():
+    vocab_size = 64
+    logits = torch.full((1, 4, vocab_size), -20.0)
+    logits[0, 0, 5] = 20.0
+    logits[0, 1, 5] = 20.0
+    logits[0, 2, 3] = 20.0
+    logits[0, 3, 1] = 20.0
+
+    # Step 1: pos 0 newly changes (9 -> 5) and pos 1 simultaneously predicts 5 -> pos 1 is deferred!
+    torch.manual_seed(7)
+    canvas_noise = torch.tensor([[9, 8, 7, 6]], dtype=torch.long)
+    out1, _, _ = _commit(
+        logits,
+        canvas_noise,
+        temperature=0.5,
+        entropy_bound=0.1,
+        vocab_size=vocab_size,
+        is_final_step=False,
+        defer_adjacent_duplicates=True,
+        exempt_tokens=(1,),
+    )
+    assert int(out1[0, 0]) == 5
+    assert int(out1[0, 2]) == 3
+    assert int(out1[0, 3]) == 1
+    assert int(out1[0, 1]) != 5  # deferred to random noise on this step!
+
+    # Step 2: pos 0 is ALREADY settled as 5 -> if model still predicts [5, 5] (true reduplication), pos 1 commits!
+    out2, _, _ = _commit(
+        logits,
+        out1,
+        temperature=0.5,
+        entropy_bound=0.1,
+        vocab_size=vocab_size,
+        is_final_step=False,
+        defer_adjacent_duplicates=True,
+        exempt_tokens=(1,),
+    )
+    assert out2[0].tolist() == [5, 5, 3, 1]
+
+    # Exempt EOS tail [1, 1, 1, 1] is never deferred even on step 1.
+    eos_logits = torch.full((1, 4, vocab_size), -20.0)
+    eos_logits[:, :, 1] = 20.0
+    out_eos, _, _ = _commit(
+        eos_logits,
+        canvas_noise,
+        temperature=0.5,
+        entropy_bound=0.1,
+        vocab_size=vocab_size,
+        is_final_step=False,
+        defer_adjacent_duplicates=True,
+        exempt_tokens=(1,),
+    )
+    assert out_eos[0].tolist() == [1, 1, 1, 1]
+
+
 def test_qwen3_vl_pilot_cli_tiny_vl_all_blocks_and_resume(tmp_path):
     out = tmp_path / "qwen3_vl_full"
     cmd = [
@@ -322,6 +406,8 @@ def test_qwen3_vl_pilot_cli_tiny_vl_all_blocks_and_resume(tmp_path):
         "--tiny-vl",
         "--training-mode",
         "all-blocks",
+        "--loss-mode",
+        "tail-capped",
         "--lora-rank",
         "0",
         "--optimizer-mode",
@@ -330,6 +416,9 @@ def test_qwen3_vl_pilot_cli_tiny_vl_all_blocks_and_resume(tmp_path):
         "entropy",
         "--repetition-penalty",
         "1.15",
+        "--defer-adjacent-dup",
+        "--eval-canvas",
+        "8",
         "--vision-ratio",
         "0.5",
         "--out",

@@ -80,6 +80,8 @@ def _commit(
     entropy_bound: float,
     vocab_size: int,
     is_final_step: bool = False,
+    defer_adjacent_duplicates: bool = False,
+    exempt_tokens: tuple[int, ...] = (),
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Keep the most confident tokens. Draw the rest again from the vocabulary unless on the final step."""
     scaled = logits.float() / max(temperature, 1e-6)
@@ -95,6 +97,17 @@ def _commit(
     if is_final_step:
         mask = torch.ones_like(mask)
     drawn = torch.multinomial(probs.view(-1, probs.shape[-1]), 1).view(canvas.shape)
+    if defer_adjacent_duplicates and not is_final_step and canvas.shape[1] >= 2:
+        # Break same-step parallel stuttering (e.g. `realtoror`, `沙发上上`):
+        # if pos i-1 newly changed to token v on this step AND pos i simultaneously sampled v,
+        # keep i-1 and defer i by 1 step so i sees i-1 cleanly next step (preserving true reduplications).
+        left_newly_changed = canvas[:, :-1] != drawn[:, :-1]
+        same_as_left = drawn[:, 1:] == drawn[:, :-1]
+        both_committing = mask[:, :-1] & mask[:, 1:]
+        conflict = both_committing & left_newly_changed & same_as_left
+        for ex in exempt_tokens:
+            conflict = conflict & (drawn[:, 1:] != int(ex))
+        mask[:, 1:] = mask[:, 1:] & (~conflict)
     noise = torch.randint(0, vocab_size, canvas.shape, device=canvas.device)
     return torch.where(mask, drawn, noise), scaled, entropy
 
@@ -271,6 +284,7 @@ def sample_canvas(
     use_kv_cache: bool = False,
     repetition_penalty: float = 1.0,
     exempt_tokens: tuple[int, ...] = (),
+    defer_adjacent_duplicates: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Denoise one canvas from uniform noise or [MASK] prior with carried self-conditioning."""
     if sampler not in ("entropy", "ddim", "mask", "remdm", "rcd"):
@@ -322,6 +336,11 @@ def sample_canvas(
                 logits, canvas, penalty=repetition_penalty, exempt_tokens=rep_exempt
             )
         if sampler == "entropy":
+            commit_extra = (
+                {"defer_adjacent_duplicates": True, "exempt_tokens": rep_exempt}
+                if defer_adjacent_duplicates
+                else {}
+            )
             next_canvas, shaped_logits, token_entropy = _commit(
                 logits,
                 canvas,
@@ -329,6 +348,7 @@ def sample_canvas(
                 entropy_bound=0.1,
                 vocab_size=vocab_size,
                 is_final_step=is_final_step,
+                **commit_extra,
             )
         elif sampler == "mask":
             progress = 1.0 - (step / max(steps, 1))
@@ -405,6 +425,7 @@ def sample_response(
     multimodal_input: dict | None = None,
     use_kv_cache: bool = False,
     repetition_penalty: float = 1.0,
+    defer_adjacent_duplicates: bool = False,
 ) -> torch.Tensor:
     """Block-autoregressive generation across canvases, truncating at the first stop token."""
     running_prompt = prompt.view(-1)
@@ -433,6 +454,7 @@ def sample_response(
             history_cache=history_cache,
             repetition_penalty=repetition_penalty,
             exempt_tokens=stop_tokens,
+            defer_adjacent_duplicates=defer_adjacent_duplicates,
         )
         row = canvas[0]
         hit_idx = None
