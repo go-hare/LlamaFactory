@@ -450,3 +450,17 @@ def test_qwen3_vl_pilot_cli_tiny_vl_all_blocks_and_resume(tmp_path):
     res2 = subprocess.run(cmd_res, capture_output=True, text=True, timeout=180)
     assert res2.returncode == 0, res2.stdout + res2.stderr
     assert (resumed / "checkpoint-2/COMPLETE").read_text() == "2"
+
+    # Also verify lightweight --no-save-optimizer save & fresh-optimizer resume!
+    light = tmp_path / "qwen3_vl_light"
+    cmd_light = cmd[: cmd.index("--out") + 1] + [str(light)] + cmd[cmd.index("--out") + 2 :] + ["--no-save-optimizer"]
+    res3 = subprocess.run(cmd_light, capture_output=True, text=True, timeout=180)
+    assert res3.returncode == 0, res3.stdout + res3.stderr
+    st = torch.load(light / "checkpoint-1/diagnostic_state.pt", map_location="cpu", weights_only=False)
+    assert st["optimizer"] is None
+    light_res = tmp_path / "qwen3_vl_light_res"
+    cmd_light_res = cmd_light[: cmd_light.index("--out") + 1] + [str(light_res)] + cmd_light[cmd_light.index("--out") + 2 :] + ["--resume", str(light / "checkpoint-1")]
+    res4 = subprocess.run(cmd_light_res, capture_output=True, text=True, timeout=180)
+    assert res4.returncode == 0, res4.stdout + res4.stderr
+    assert "RESUME_FRESH_OPTIMIZER" in res4.stdout
+    assert (light_res / "checkpoint-2/COMPLETE").read_text() == "2"

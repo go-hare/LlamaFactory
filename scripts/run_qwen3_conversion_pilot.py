@@ -643,13 +643,16 @@ def compute_lr(
     min_lr_ratio: float = 0.1,
     scheduler: str = "cosine",
     start_step: int = 0,
+    resume_warmup_steps: int = 0,
 ) -> float:
-    """Linear warmup (for fresh runs) followed by cosine annealing or constant schedule."""
+    """Linear warmup (for fresh runs or fresh-optimizer resumes) followed by cosine annealing or constant schedule."""
     if start_step == 0 and warmup_steps > 0 and step <= warmup_steps:
         return peak_lr * (step / warmup_steps)
+    if start_step > 0 and resume_warmup_steps > 0 and (step - start_step) <= resume_warmup_steps:
+        return peak_lr * ((step - start_step) / resume_warmup_steps)
     if scheduler == "constant":
         return peak_lr
-    decay_start = warmup_steps if start_step == 0 else start_step
+    decay_start = warmup_steps if start_step == 0 else (start_step + resume_warmup_steps)
     denom = max(max_steps - decay_start, 1)
     progress = min(max((step - decay_start) / denom, 0.0), 1.0)
     cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
@@ -712,6 +715,7 @@ def arguments():
     parser.add_argument("--repetition-penalty", type=float, default=1.0, help="Local neighbor repetition penalty during sampling (>1.0 dampens comma runs)")
     parser.add_argument("--defer-adjacent-dup", action="store_true", help="Defer same-step adjacent duplicate commits by 1 step to eliminate parallel stuttering")
     parser.add_argument("--eval-canvas", type=int, default=0, help="Optional smaller canvas size during generation eval (e.g. 64 or 128; 0 = training canvas)")
+    parser.add_argument("--no-save-optimizer", action="store_true", help="Omit optimizer state from checkpoints (~9GB vs ~55GB; prevents Google Drive FUSE upload stalls)")
     parser.add_argument("--keep-checkpoints", type=int, default=2)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--tiny", action="store_true")
@@ -828,6 +832,7 @@ def main():
     if args.eval_only and not args.resume:
         raise RuntimeError("--eval-only requires --resume <checkpoint>")
     step = 0
+    resume_warmup_steps = 0
     if args.resume:
         if not (args.resume / "COMPLETE").is_file():
             raise RuntimeError("Incomplete checkpoint")
@@ -851,7 +856,11 @@ def main():
         _get_conditioner(model).load_state_dict(load_file(str(args.resume / "self_conditioner.safetensors")), strict=True)
         step = restored["global_step"]
         if not args.eval_only:
-            optimizer.load_state_dict(restored["optimizer"])
+            if restored.get("optimizer") is not None:
+                optimizer.load_state_dict(restored["optimizer"])
+            else:
+                resume_warmup_steps = min(20, max(1, args.max_steps - step))
+                print("RESUME_FRESH_OPTIMIZER", {"step": step, "resume_warmup_steps": resume_warmup_steps}, flush=True)
             torch.set_rng_state(restored["cpu_rng"])
             if restored["cuda_rng"] is not None:
                 torch.cuda.set_rng_state_all(restored["cuda_rng"])
@@ -899,6 +908,7 @@ def main():
                 min_lr_ratio=args.min_lr_ratio,
                 scheduler=args.lr_scheduler,
                 start_step=resume_start,
+                resume_warmup_steps=resume_warmup_steps,
             )
             for group in optimizer.param_groups:
                 group["lr"] = lr
@@ -1031,6 +1041,7 @@ def main():
                     args.out,
                     {"global_step": step, "settings": settings, "sampled_block_counts": dict(block_counts)},
                     keep=args.keep_checkpoints,
+                    save_optimizer=not bool(args.no_save_optimizer),
                 )
                 with preserve_rng():
                     evaluate(

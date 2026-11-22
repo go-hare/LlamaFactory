@@ -289,7 +289,7 @@ def evaluate(model, tokenizer, active, heldout, args, canvas):
         model.train(was_training)
 
 
-def save_checkpoint(model, tokenizer, optimizer, out, state, *, keep: int = 2):
+def save_checkpoint(model, tokenizer, optimizer, out, state, *, keep: int = 2, save_optimizer: bool = True):
     from safetensors.torch import save_file
 
     if keep < 1:
@@ -309,7 +309,7 @@ def save_checkpoint(model, tokenizer, optimizer, out, state, *, keep: int = 2):
     )
     state = dict(
         state,
-        optimizer=optimizer.state_dict(),
+        optimizer=optimizer.state_dict() if save_optimizer else None,
         cpu_rng=torch.get_rng_state(),
         cuda_rng=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         python_rng=random.getstate(),
