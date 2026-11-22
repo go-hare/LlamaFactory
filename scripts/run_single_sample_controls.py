@@ -289,7 +289,18 @@ def evaluate(model, tokenizer, active, heldout, args, canvas):
         model.train(was_training)
 
 
-def save_checkpoint(model, tokenizer, optimizer, out, state, *, keep: int = 2, save_optimizer: bool = True):
+def save_checkpoint(
+    model,
+    tokenizer,
+    optimizer,
+    out,
+    state,
+    *,
+    keep: int = 2,
+    save_optimizer: bool = True,
+    max_shard_size: str = "2GB",
+    hf_repo: str | None = None,
+):
     from safetensors.torch import save_file
 
     if keep < 1:
@@ -300,7 +311,10 @@ def save_checkpoint(model, tokenizer, optimizer, out, state, *, keep: int = 2, s
     if staging.exists() or target.exists():
         raise FileExistsError(f"Checkpoint destination already exists: {target}. Nothing overwritten.")
     staging.mkdir()
-    model.save_pretrained(staging)
+    try:
+        model.save_pretrained(staging, max_shard_size=max_shard_size)
+    except TypeError:
+        model.save_pretrained(staging)
     if hasattr(tokenizer, "save_pretrained"):
         tokenizer.save_pretrained(staging)
     save_file(
@@ -319,6 +333,19 @@ def save_checkpoint(model, tokenizer, optimizer, out, state, *, keep: int = 2, s
     staging.rename(target)
     write_json(out / "latest_checkpoint.json", {"path": str(target)})
     print("CHECKPOINT_COMPLETE", target, flush=True)
+    if hf_repo:
+        from huggingface_hub import HfApi
+
+        api = HfApi()
+        api.create_repo(repo_id=hf_repo, repo_type="model", private=True, exist_ok=True)
+        api.upload_folder(
+            folder_path=str(target),
+            repo_id=hf_repo,
+            repo_type="model",
+            path_in_repo=target.name,
+            commit_message=f"Checkpoint step {step}",
+        )
+        print("HF_CHECKPOINT_UPLOADED", f"{hf_repo}/{target.name}", flush=True)
     # Preserve `keep` complete recovery points; never delete an unfinished save.
     checkpoints = sorted(
         [p for p in out.glob("checkpoint-*") if (p / "COMPLETE").is_file()],

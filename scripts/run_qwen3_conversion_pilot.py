@@ -716,6 +716,7 @@ def arguments():
     parser.add_argument("--defer-adjacent-dup", action="store_true", help="Defer same-step adjacent duplicate commits by 1 step to eliminate parallel stuttering")
     parser.add_argument("--eval-canvas", type=int, default=0, help="Optional smaller canvas size during generation eval (e.g. 64 or 128; 0 = training canvas)")
     parser.add_argument("--no-save-optimizer", action="store_true", help="Omit optimizer state from checkpoints (~9GB vs ~55GB; prevents Google Drive FUSE upload stalls)")
+    parser.add_argument("--hf-repo", type=str, default=None, help="Optional private HF model repo to synchronously upload each checkpoint (e.g. user/qwen3-vl-4b-diff)")
     parser.add_argument("--keep-checkpoints", type=int, default=2)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--tiny", action="store_true")
@@ -1042,6 +1043,7 @@ def main():
                     {"global_step": step, "settings": settings, "sampled_block_counts": dict(block_counts)},
                     keep=args.keep_checkpoints,
                     save_optimizer=not bool(args.no_save_optimizer),
+                    hf_repo=args.hf_repo,
                 )
                 with preserve_rng():
                     evaluate(
