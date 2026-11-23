@@ -15,6 +15,9 @@ the rest are drawn again from the vocabulary.
 
 from __future__ import annotations
 
+import math
+from contextlib import contextmanager, nullcontext
+
 import torch
 import torch.nn.functional as F
 
@@ -22,11 +25,14 @@ from .adapter import get_diffusion_adapter
 from .loss import (
     DiffusionHistoryCache,
     _embed_distribution,
+    _get_conditioner,
     _token_embedding,
+    _topk_forward_kl,
     denoise_step_logits,
     rcd_residual_signal,
     supports_history_kv_cache,
 )
+from .objective import resolve_objective
 
 
 def _apply_local_repetition_penalty(
@@ -82,6 +88,7 @@ def _commit(
     is_final_step: bool = False,
     defer_adjacent_duplicates: bool = False,
     exempt_tokens: tuple[int, ...] = (),
+    min_keep: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Keep the most confident tokens. Draw the rest again from the vocabulary unless on the final step."""
     scaled = logits.float() / max(temperature, 1e-6)
@@ -92,6 +99,8 @@ def _commit(
     order = entropy.argsort(dim=-1)
     sorted_entropy = entropy.gather(1, order)
     keep = (sorted_entropy.cumsum(dim=-1) - sorted_entropy) <= entropy_bound
+    if min_keep > 0:
+        keep[:, : min(int(min_keep), keep.shape[1])] = True
     mask = torch.zeros_like(keep)
     mask.scatter_(1, order, keep)
     if is_final_step:
@@ -285,6 +294,7 @@ def sample_canvas(
     repetition_penalty: float = 1.0,
     exempt_tokens: tuple[int, ...] = (),
     defer_adjacent_duplicates: bool = False,
+    progressive_commit: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Denoise one canvas from uniform noise or [MASK] prior with carried self-conditioning."""
     if sampler not in ("entropy", "ddim", "mask", "remdm", "rcd"):
@@ -336,11 +346,12 @@ def sample_canvas(
                 logits, canvas, penalty=repetition_penalty, exempt_tokens=rep_exempt
             )
         if sampler == "entropy":
-            commit_extra = (
-                {"defer_adjacent_duplicates": True, "exempt_tokens": rep_exempt}
-                if defer_adjacent_duplicates
-                else {}
-            )
+            commit_extra: dict = {}
+            if defer_adjacent_duplicates:
+                commit_extra["defer_adjacent_duplicates"] = True
+                commit_extra["exempt_tokens"] = rep_exempt
+            if progressive_commit:
+                commit_extra["min_keep"] = math.ceil((step + 1) * canvas_size / max(steps, 1))
             next_canvas, shaped_logits, token_entropy = _commit(
                 logits,
                 canvas,
@@ -426,6 +437,7 @@ def sample_response(
     use_kv_cache: bool = False,
     repetition_penalty: float = 1.0,
     defer_adjacent_duplicates: bool = False,
+    progressive_commit: bool = False,
 ) -> torch.Tensor:
     """Block-autoregressive generation across canvases, truncating at the first stop token."""
     running_prompt = prompt.view(-1)
@@ -455,6 +467,7 @@ def sample_response(
             repetition_penalty=repetition_penalty,
             exempt_tokens=stop_tokens,
             defer_adjacent_duplicates=defer_adjacent_duplicates,
+            progressive_commit=progressive_commit,
         )
         row = canvas[0]
         hit_idx = None
@@ -531,3 +544,236 @@ def sd_rl_step(
     policy = F.cross_entropy(last.reshape(-1, last.shape[-1]), teacher.reshape(-1))
     loss = distill + (-reward) * policy
     return loss, {"reward": reward, "distill_loss": float(distill.detach()), "entropy": float(entropy)}
+
+
+@contextmanager
+def _swap_conditioner(model, replacement):
+    if replacement is None:
+        yield
+        return
+    base = model.get_base_model() if hasattr(model, "get_base_model") else model
+    holder = None
+    for cand in (model, base, getattr(base, "model", None)):
+        if cand is not None and hasattr(cand, "self_conditioner") and getattr(cand, "self_conditioner") is not None:
+            holder = cand
+            break
+    if holder is None:
+        yield
+        return
+    saved = holder.self_conditioner
+    holder.self_conditioner = replacement
+    try:
+        yield
+    finally:
+        holder.self_conditioner = saved
+
+
+def few_step_distill_step(
+    model,
+    prompt: torch.Tensor,
+    response: torch.Tensor,
+    *,
+    canvas_size: int = 128,
+    num_canvases: int = 18,
+    pad_id: int = 0,
+    eos_id: int = 1,
+    student_steps: int = 16,
+    teacher_substeps: int = 4,
+    train_points: int = 3,
+    loss_mode: str = "tail-capped",
+    kl_weight: float = 0.5,
+    kl_topk: int = 64,
+    kl_temp: float = 1.0,
+    temperature: float = 0.7,
+    teacher_conditioner=None,
+    multimodal_input: dict | None = None,
+    backward_per_point: bool = False,
+    loss_scale: float = 1.0,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Stage-2 few-step sampler distillation: guided entropy trajectory + N-to-1 progressive teacher refinement.
+
+    1. Rolls out the student's exact ``student_steps`` progressive-commit entropy trajectory on a
+       ground-truth block (using ``DiffusionHistoryCache`` for O(1) vision/history cost), capturing
+       structured intermediate states ``(x_k, sc_k)`` without phrasing drift.
+    2. From ``train_points`` stratified points along the trajectory, runs ``teacher_substeps`` careful
+       steps of the frozen Stage-1 teacher (via PEFT ``disable_adapter()`` + ``teacher_conditioner``)
+       starting from the student's exact state ``(x_k, sc_k)``, giving a soft top-K refinement target
+       strictly on uncommitted positions.
+    3. Trains the student on ``tail-capped`` CE + sparse forward KL so 1 student step matches
+       ``teacher_substeps`` Stage-1 steps.
+    """
+    device = _token_embedding(model).weight.device
+    text_config = getattr(model.config, "text_config", model.config)
+    vocab_size = int(getattr(text_config, "vocab_size", 0) or model.config.vocab_size)
+    hidden_size = int(getattr(text_config, "hidden_size", 0) or model.config.hidden_size)
+    token_embedding = _token_embedding(model)
+    model_dtype = token_embedding.weight.dtype
+    adapter = get_diffusion_adapter(model)
+    embed_scale = adapter.embed_scale(model)
+    objective = resolve_objective(loss_mode)
+
+    p = prompt.to(device=device, dtype=torch.long).view(-1)
+    r = response.to(device=device, dtype=torch.long).view(-1)
+    if p.numel() == 0:
+        raise ValueError("Diffusion prompt is empty.")
+
+    n_valid_blocks = max(1, min(num_canvases, (int(r.numel()) + canvas_size - 1) // canvas_size))
+    blk = int(torch.randint(0, n_valid_blocks, (), device=device).item())
+    begin = blk * canvas_size
+    body = r[begin : begin + canvas_size]
+    body_tokens = int(body.numel())
+    clean = r.new_full((canvas_size,), eos_id)
+    if body_tokens > 0:
+        clean[:body_tokens] = body
+    history = torch.cat([p, r[:begin]], dim=0) if begin > 0 else p
+
+    was_training = model.training
+    use_cache = supports_history_kv_cache(model)
+    temp_scale = max(float(temperature), 1e-4) / 0.7
+
+    # 1. Guided progressive-commit entropy trajectory under torch.no_grad()
+    traj: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]] = []
+    model.eval()
+    with torch.no_grad():
+        s_cache = None
+        if use_cache:
+            s_cache = DiffusionHistoryCache(model, pad_id=pad_id)
+            s_cache.prefill(history, multimodal_input=multimodal_input)
+        x = torch.randint(0, vocab_size, (1, canvas_size), device=device)
+        sc = torch.zeros(1, canvas_size, hidden_size, device=device, dtype=model_dtype)
+        committed = torch.zeros(1, canvas_size, dtype=torch.bool, device=device)
+        for k in range(student_steps):
+            traj.append((x.clone(), sc.clone(), committed.clone(), k))
+            if s_cache is not None:
+                logits_k = s_cache.denoise_step_logits(x[0], sc_embeddings=sc)
+            else:
+                logits_k = denoise_step_logits(
+                    model, history, x[0], sc_embeddings=sc, pad_id=pad_id, multimodal_input=multimodal_input
+                )
+            step_temp = _temperature(k, student_steps, start=0.8 * temp_scale, end=0.4 * temp_scale)
+            scaled = logits_k.float() / max(step_temp, 1e-6)
+            log_p = torch.log_softmax(scaled, dim=-1)
+            probs = torch.exp(log_p)
+            safe_lp = torch.where(probs == 0, torch.zeros_like(log_p), log_p)
+            ent = -(safe_lp * probs).sum(dim=-1)
+            # Already-committed tokens stay committed; prioritize lowest-entropy uncommitted tokens.
+            rank_ent = torch.where(committed, torch.full_like(ent, -1.0), ent)
+            order = rank_ent.argsort(dim=-1)
+            sorted_ent = ent.gather(1, order)
+            keep = (sorted_ent.cumsum(dim=-1) - sorted_ent) <= 0.1
+            min_keep = math.ceil((k + 1) * canvas_size / max(student_steps, 1))
+            keep[:, : min(min_keep, canvas_size)] = True
+            new_mask = torch.zeros_like(keep)
+            new_mask.scatter_(1, order, keep)
+            committed = committed | new_mask
+            noise = torch.randint(0, vocab_size, (1, canvas_size), device=device)
+            x = torch.where(committed, clean[None, :], noise)
+            sc = _embed_distribution(token_embedding, scaled, scale=embed_scale)
+
+    # 2. Stratified point selection across [0, student_steps)
+    m_pts = max(1, min(int(train_points), student_steps))
+    selected_indices: list[int] = []
+    for s_idx in range(m_pts):
+        lo = (s_idx * student_steps) // m_pts
+        hi = max(lo + 1, ((s_idx + 1) * student_steps) // m_pts)
+        selected_indices.append(int(torch.randint(lo, hi, (), device=device).item()))
+
+    # 3. Frozen Stage-1 teacher N-to-1 progressive refinement from exact student states
+    use_teacher_kl = float(kl_weight) > 0.0 and int(teacher_substeps) > 0 and (
+        hasattr(model, "disable_adapter") or teacher_conditioner is not None
+    )
+    teacher_targets: list[tuple[torch.Tensor, torch.Tensor] | None] = [None] * m_pts
+    if use_teacher_kl:
+        disable_ctx = model.disable_adapter() if hasattr(model, "disable_adapter") else nullcontext()
+        k_top = min(max(int(kl_topk), 1), vocab_size)
+        t_temp = max(float(kl_temp), 1e-4)
+        with torch.no_grad(), disable_ctx, _swap_conditioner(model, teacher_conditioner):
+            t_cache = None
+            if use_cache:
+                t_cache = DiffusionHistoryCache(model, pad_id=pad_id)
+                t_cache.prefill(history, multimodal_input=multimodal_input)
+            for p_i, t_idx in enumerate(selected_indices):
+                x_k, sc_k, _, k = traj[t_idx]
+                tx = x_k.clone()
+                tsc = sc_k.clone()
+                last_t_logits = None
+                for j in range(teacher_substeps):
+                    if t_cache is not None:
+                        last_t_logits = t_cache.denoise_step_logits(tx[0], sc_embeddings=tsc)
+                    else:
+                        last_t_logits = denoise_step_logits(
+                            model, history, tx[0], sc_embeddings=tsc, pad_id=pad_id, multimodal_input=multimodal_input
+                        )
+                    frac = (k + (j + 1) / teacher_substeps) / max(student_steps, 1)
+                    sub_keep = min(canvas_size, math.ceil(frac * canvas_size))
+                    sub_temp = _temperature(
+                        int(round(frac * student_steps)), student_steps, start=0.8 * temp_scale, end=0.4 * temp_scale
+                    )
+                    tx, t_scaled, _ = _commit(
+                        last_t_logits,
+                        tx,
+                        temperature=sub_temp,
+                        entropy_bound=0.1,
+                        vocab_size=vocab_size,
+                        is_final_step=False,
+                        defer_adjacent_duplicates=True,
+                        exempt_tokens=(pad_id, eos_id),
+                        min_keep=sub_keep,
+                    )
+                    tsc = _embed_distribution(token_embedding, t_scaled, scale=embed_scale)
+                top_vals, top_idx = torch.topk(last_t_logits[0].float(), k=k_top, dim=-1)
+                top_p = torch.softmax(top_vals / t_temp, dim=-1)
+                teacher_targets[p_i] = (top_p, top_idx)
+
+    # 4. Student forward + loss on sampled trajectory points
+    if was_training:
+        model.train()
+    valid = torch.ones(canvas_size, dtype=torch.bool, device=device)
+    point_losses: list[torch.Tensor] = []
+    ce_sum = 0.0
+    kl_sum = 0.0
+    for p_i, t_idx in enumerate(selected_indices):
+        x_k, sc_k, committed_k, k = traj[t_idx]
+        s_logits = denoise_step_logits(
+            model,
+            history,
+            x_k[0],
+            sc_embeddings=sc_k,
+            pad_id=pad_id,
+            multimodal_input=multimodal_input,
+        )[0]
+        uncommitted = ~committed_k[0]
+        if not bool(uncommitted.any()):
+            uncommitted = valid
+        ce_loss = objective.compute(
+            s_logits,
+            clean,
+            valid,
+            uncommitted,
+            body_tokens=body_tokens,
+            time=max(1e-4, 1.0 - k / max(student_steps, 1)),
+        )
+        kl_loss = torch.zeros((), device=device, dtype=ce_loss.dtype)
+        if teacher_targets[p_i] is not None:
+            top_p, top_idx = teacher_targets[p_i]
+            kl_loss = _topk_forward_kl(
+                s_logits[uncommitted], top_p[uncommitted], top_idx[uncommitted], kl_temp=kl_temp
+            ).mean()
+        pt_loss = ce_loss + float(kl_weight) * kl_loss
+        ce_sum += float(ce_loss.detach())
+        kl_sum += float(kl_loss.detach())
+        if backward_per_point:
+            (pt_loss * (float(loss_scale) / m_pts)).backward()
+            point_losses.append(pt_loss.detach())
+        else:
+            point_losses.append(pt_loss)
+
+    mean_loss = torch.stack(point_losses).mean()
+    return mean_loss, {
+        "loss": float(mean_loss.detach()),
+        "ce_loss": ce_sum / m_pts,
+        "kl_loss": kl_sum / m_pts,
+        "selected_block": blk,
+        "body_tokens": body_tokens,
+        "train_points": m_pts,
+    }

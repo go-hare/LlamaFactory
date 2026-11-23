@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import ExitStack, contextmanager
+import inspect
 from types import MethodType, SimpleNamespace
 from typing import Any, Protocol
 
@@ -515,7 +516,11 @@ class _Qwen3VLMultimodalBatch:
 
         if pv_parts:
             self.has_multimodal = True
-            if hasattr(base, "get_image_features") and not self.vit_trainable:
+            try:
+                supports_precomputed = "mm_encoder_outputs" in inspect.signature(base.forward).parameters
+            except (TypeError, ValueError):
+                supports_precomputed = False
+            if supports_precomputed and hasattr(base, "get_image_features") and not self.vit_trainable:
                 cat_pv = torch.cat(pv_parts, dim=0)
                 cat_grid = torch.cat(grid_parts, dim=0)
                 with torch.no_grad():
