@@ -121,6 +121,69 @@ def _commit(
     return torch.where(mask, drawn, noise), scaled, entropy
 
 
+def _aligned_sc(
+    token_embedding: torch.nn.Module,
+    canvas: torch.Tensor,
+    committed: torch.Tensor,
+    scaled_logits: torch.Tensor,
+    *,
+    scale: float,
+) -> torch.Tensor:
+    """Keep self-conditioning aligned with locked tokens while carrying soft distributions on noise."""
+    sc_soft = _embed_distribution(token_embedding, scaled_logits, scale=scale)
+    sc_comm = token_embedding(canvas) * scale
+    return torch.where(committed.unsqueeze(-1), sc_comm.to(dtype=sc_soft.dtype), sc_soft)
+
+
+def _frontier_commit_step(
+    logits: torch.Tensor,
+    canvas: torch.Tensor,
+    committed: torch.Tensor,
+    *,
+    temperature: float,
+    entropy_bound: float,
+    vocab_size: int,
+    target_total: int,
+    is_final_step: bool = False,
+    defer_adjacent_duplicates: bool = False,
+    exempt_tokens: tuple[int, ...] = (),
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Lock already-committed tokens, unlock confident tokens, and advance strictly from the left frontier."""
+    scaled = logits.float() / max(temperature, 1e-6)
+    log_probs = torch.log_softmax(scaled, dim=-1)
+    probs = torch.exp(log_probs)
+    safe_log_probs = torch.where(probs == 0, torch.zeros_like(log_probs), log_probs)
+    entropy = -(safe_log_probs * probs).sum(dim=-1)
+    drawn = torch.multinomial(probs.view(-1, probs.shape[-1]), 1).view(canvas.shape)
+
+    if is_final_step:
+        new_commit = ~committed
+    else:
+        uncomm = ~committed
+        low_ent = uncomm & (entropy <= float(entropy_bound))
+        new_commit = low_ent.clone()
+        for b in range(canvas.shape[0]):
+            already = int((committed[b] | low_ent[b]).sum().item())
+            need = max(0, int(target_total) - already)
+            if need > 0:
+                rem_pos = (uncomm[b] & (~low_ent[b])).nonzero(as_tuple=False).flatten()
+                if rem_pos.numel() > 0:
+                    new_commit[b, rem_pos[:need]] = True
+        if defer_adjacent_duplicates and canvas.shape[1] >= 2:
+            left_tok = torch.where(committed[:, :-1], canvas[:, :-1], drawn[:, :-1])
+            same_left = drawn[:, 1:] == left_tok
+            both = (committed[:, :-1] | new_commit[:, :-1]) & new_commit[:, 1:]
+            conflict = both & same_left
+            for ex in exempt_tokens:
+                conflict = conflict & (drawn[:, 1:] != int(ex))
+            new_commit[:, 1:] = new_commit[:, 1:] & (~conflict)
+
+    noise = torch.randint(0, vocab_size, canvas.shape, device=canvas.device)
+    next_canvas = torch.where(committed, canvas, torch.where(new_commit, drawn, noise))
+    next_committed = committed | new_commit
+    return next_canvas, next_committed, scaled, entropy
+
+
 def _ddim_step(
     logits: torch.Tensor,
     canvas: torch.Tensor,
@@ -297,7 +360,7 @@ def sample_canvas(
     progressive_commit: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Denoise one canvas from uniform noise or [MASK] prior with carried self-conditioning."""
-    if sampler not in ("entropy", "ddim", "mask", "remdm", "rcd"):
+    if sampler not in ("entropy", "frontier", "ddim", "mask", "remdm", "rcd"):
         raise ValueError(f"Unknown diffusion sampler: {sampler}")
     if sampler in ("mask", "remdm", "rcd") and mask_id is None:
         raise ValueError(f"sampler={sampler!r} requires an explicit mask_id.")
@@ -311,6 +374,7 @@ def sample_canvas(
         canvas = torch.full((1, canvas_size), int(mask_id), dtype=torch.long, device=prompt.device)
     else:
         canvas = torch.randint(0, vocab_size, (1, canvas_size), device=prompt.device)
+    committed = torch.zeros(1, canvas_size, dtype=torch.bool, device=prompt.device)
     sc_embeddings = torch.zeros(1, canvas_size, hidden_size, device=prompt.device, dtype=token_embedding.weight.dtype)
     mean_entropy = torch.zeros((), device=prompt.device)
     ddim_times = torch.linspace(1.0 - 1e-6, 0.0, steps + 1, device=prompt.device) if sampler in ("ddim", "remdm", "rcd") else None
@@ -345,7 +409,20 @@ def sample_canvas(
             logits = _apply_local_repetition_penalty(
                 logits, canvas, penalty=repetition_penalty, exempt_tokens=rep_exempt
             )
-        if sampler == "entropy":
+        if sampler == "frontier":
+            next_canvas, committed, shaped_logits, token_entropy = _frontier_commit_step(
+                logits,
+                canvas,
+                committed,
+                temperature=_temperature(step, steps, start=0.8 * temp_scale, end=0.4 * temp_scale),
+                entropy_bound=0.15,
+                vocab_size=vocab_size,
+                target_total=math.ceil((step + 1) * canvas_size / max(steps, 1)),
+                is_final_step=is_final_step,
+                defer_adjacent_duplicates=defer_adjacent_duplicates,
+                exempt_tokens=rep_exempt,
+            )
+        elif sampler == "entropy":
             commit_extra: dict = {}
             if defer_adjacent_duplicates:
                 commit_extra["defer_adjacent_duplicates"] = True
@@ -398,7 +475,14 @@ def sample_canvas(
                 protect_stop_time=protect_stop_time,
             )
         mean_entropy = token_entropy.mean()
-        if sampler == "rcd":
+        if sampler == "frontier":
+            sc_embeddings = _aligned_sc(
+                token_embedding, next_canvas, committed, shaped_logits, scale=embed_scale
+            )
+            if early_stop and bool(committed.all()):
+                canvas = next_canvas
+                break
+        elif sampler == "rcd":
             sc_embeddings = rcd_residual_signal(
                 token_embedding,
                 shaped_logits,
@@ -410,7 +494,7 @@ def sample_canvas(
             sc_embeddings = _embed_distribution(token_embedding, shaped_logits, scale=embed_scale)
         stable = bool((shaped_logits.argmax(dim=-1) == canvas).all())
         confident = bool(mean_entropy <= entropy_threshold)
-        if early_stop and stable and confident and not (sampler in ("mask", "remdm", "rcd") and bool((next_canvas == int(mask_id)).any())):
+        if sampler != "frontier" and early_stop and stable and confident and not (sampler in ("mask", "remdm", "rcd") and bool((next_canvas == int(mask_id)).any())):
             canvas = next_canvas
             break
         canvas = next_canvas
@@ -610,7 +694,7 @@ def few_step_distill_step(
     model_dtype = token_embedding.weight.dtype
     adapter = get_diffusion_adapter(model)
     embed_scale = adapter.embed_scale(model)
-    objective = resolve_objective(loss_mode)
+    resolve_objective(loss_mode)
 
     p = prompt.to(device=device, dtype=torch.long).view(-1)
     r = response.to(device=device, dtype=torch.long).view(-1)
@@ -630,8 +714,9 @@ def few_step_distill_step(
     was_training = model.training
     use_cache = supports_history_kv_cache(model)
     temp_scale = max(float(temperature), 1e-4) / 0.7
+    chunk = max(1, math.ceil(canvas_size / max(student_steps, 1)))
 
-    # 1. Guided progressive-commit entropy trajectory under torch.no_grad()
+    # 1. Guided frontier-anchored trajectory with aligned self-conditioning under torch.no_grad()
     traj: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]] = []
     model.eval()
     with torch.no_grad():
@@ -651,34 +736,34 @@ def few_step_distill_step(
                     model, history, x[0], sc_embeddings=sc, pad_id=pad_id, multimodal_input=multimodal_input
                 )
             step_temp = _temperature(k, student_steps, start=0.8 * temp_scale, end=0.4 * temp_scale)
-            scaled = logits_k.float() / max(step_temp, 1e-6)
-            log_p = torch.log_softmax(scaled, dim=-1)
-            probs = torch.exp(log_p)
-            safe_lp = torch.where(probs == 0, torch.zeros_like(log_p), log_p)
-            ent = -(safe_lp * probs).sum(dim=-1)
-            # Already-committed tokens stay committed; prioritize lowest-entropy uncommitted tokens.
-            rank_ent = torch.where(committed, torch.full_like(ent, -1.0), ent)
-            order = rank_ent.argsort(dim=-1)
-            sorted_ent = ent.gather(1, order)
-            keep = (sorted_ent.cumsum(dim=-1) - sorted_ent) <= 0.1
-            min_keep = math.ceil((k + 1) * canvas_size / max(student_steps, 1))
-            keep[:, : min(min_keep, canvas_size)] = True
-            new_mask = torch.zeros_like(keep)
-            new_mask.scatter_(1, order, keep)
-            committed = committed | new_mask
+            _, next_committed, scaled, _ = _frontier_commit_step(
+                logits_k,
+                x,
+                committed,
+                temperature=step_temp,
+                entropy_bound=0.15,
+                vocab_size=vocab_size,
+                target_total=math.ceil((k + 1) * canvas_size / max(student_steps, 1)),
+                is_final_step=(k + 1) >= student_steps,
+                defer_adjacent_duplicates=False,
+            )
+            committed = next_committed
             noise = torch.randint(0, vocab_size, (1, canvas_size), device=device)
             x = torch.where(committed, clean[None, :], noise)
-            sc = _embed_distribution(token_embedding, scaled, scale=embed_scale)
+            sc = _aligned_sc(token_embedding, x, committed, scaled, scale=embed_scale)
+            if bool(committed.all()):
+                break
 
-    # 2. Stratified point selection across [0, student_steps)
-    m_pts = max(1, min(int(train_points), student_steps))
+    # 2. Stratified point selection across captured trajectory states
+    n_traj = len(traj)
+    m_pts = max(1, min(int(train_points), n_traj))
     selected_indices: list[int] = []
     for s_idx in range(m_pts):
-        lo = (s_idx * student_steps) // m_pts
-        hi = max(lo + 1, ((s_idx + 1) * student_steps) // m_pts)
+        lo = (s_idx * n_traj) // m_pts
+        hi = max(lo + 1, ((s_idx + 1) * n_traj) // m_pts)
         selected_indices.append(int(torch.randint(lo, hi, (), device=device).item()))
 
-    # 3. Frozen Stage-1 teacher N-to-1 progressive refinement from exact student states
+    # 3. Frozen Stage-1 teacher N-to-1 fine-grained frontier refinement from exact student states
     use_teacher_kl = float(kl_weight) > 0.0 and int(teacher_substeps) > 0 and (
         hasattr(model, "disable_adapter") or teacher_conditioner is not None
     )
@@ -693,9 +778,11 @@ def few_step_distill_step(
                 t_cache = DiffusionHistoryCache(model, pad_id=pad_id)
                 t_cache.prefill(history, multimodal_input=multimodal_input)
             for p_i, t_idx in enumerate(selected_indices):
-                x_k, sc_k, _, k = traj[t_idx]
+                x_k, sc_k, comm_k, k = traj[t_idx]
                 tx = x_k.clone()
                 tsc = sc_k.clone()
+                t_comm = comm_k.clone()
+                n_base = int(t_comm.sum().item())
                 last_t_logits = None
                 for j in range(teacher_substeps):
                     if t_cache is not None:
@@ -704,31 +791,38 @@ def few_step_distill_step(
                         last_t_logits = denoise_step_logits(
                             model, history, tx[0], sc_embeddings=tsc, pad_id=pad_id, multimodal_input=multimodal_input
                         )
-                    frac = (k + (j + 1) / teacher_substeps) / max(student_steps, 1)
-                    sub_keep = min(canvas_size, math.ceil(frac * canvas_size))
-                    sub_temp = _temperature(
-                        int(round(frac * student_steps)), student_steps, start=0.8 * temp_scale, end=0.4 * temp_scale
-                    )
-                    tx, t_scaled, _ = _commit(
-                        last_t_logits,
-                        tx,
-                        temperature=sub_temp,
-                        entropy_bound=0.1,
-                        vocab_size=vocab_size,
-                        is_final_step=False,
-                        defer_adjacent_duplicates=True,
-                        exempt_tokens=(pad_id, eos_id),
-                        min_keep=sub_keep,
-                    )
-                    tsc = _embed_distribution(token_embedding, t_scaled, scale=embed_scale)
+                    if j + 1 < teacher_substeps:
+                        sub_target = min(
+                            canvas_size, n_base + math.ceil((j + 1) * chunk / max(teacher_substeps, 1))
+                        )
+                        frac = (k + (j + 1) / teacher_substeps) / max(student_steps, 1)
+                        sub_temp = _temperature(
+                            int(round(frac * student_steps)), student_steps, start=0.8 * temp_scale, end=0.4 * temp_scale
+                        )
+                        tx, t_comm, t_scaled, _ = _frontier_commit_step(
+                            last_t_logits,
+                            tx,
+                            t_comm,
+                            temperature=sub_temp,
+                            entropy_bound=0.15,
+                            vocab_size=vocab_size,
+                            target_total=sub_target,
+                            is_final_step=False,
+                            defer_adjacent_duplicates=True,
+                            exempt_tokens=(pad_id, eos_id),
+                        )
+                        tsc = _aligned_sc(token_embedding, tx, t_comm, t_scaled, scale=embed_scale)
                 top_vals, top_idx = torch.topk(last_t_logits[0].float(), k=k_top, dim=-1)
                 top_p = torch.softmax(top_vals / t_temp, dim=-1)
                 teacher_targets[p_i] = (top_p, top_idx)
 
-    # 4. Student forward + loss on sampled trajectory points
+    # 4. Student forward + frontier-focused CE + teacher KL on sampled trajectory points
     if was_training:
         model.train()
-    valid = torch.ones(canvas_size, dtype=torch.bool, device=device)
+    pos_idx = torch.arange(canvas_size, device=device)
+    body_mask = pos_idx < body_tokens
+    tail_mask = ~body_mask
+    frontier_win = max(chunk * 2, 8)
     point_losses: list[torch.Tensor] = []
     ce_sum = 0.0
     kl_sum = 0.0
@@ -743,21 +837,31 @@ def few_step_distill_step(
             multimodal_input=multimodal_input,
         )[0]
         uncommitted = ~committed_k[0]
-        if not bool(uncommitted.any()):
-            uncommitted = valid
-        ce_loss = objective.compute(
-            s_logits,
-            clean,
-            valid,
-            uncommitted,
-            body_tokens=body_tokens,
-            time=max(1e-4, 1.0 - k / max(student_steps, 1)),
-        )
+        uncomm_pos = uncommitted.nonzero(as_tuple=False).flatten()
+        frontier_mask = torch.zeros(canvas_size, dtype=torch.bool, device=device)
+        if uncomm_pos.numel() > 0:
+            frontier_mask[uncomm_pos[:frontier_win]] = True
+        else:
+            frontier_mask[:] = True
+
+        # Focus gradient on the active multi-token frontier while keeping committed preservation & global planning.
+        weights = torch.full((canvas_size,), 0.15, device=device, dtype=torch.float32)
+        weights[frontier_mask] = 1.0
+        if loss_mode == "tail-capped" and bool(body_mask.any()) and bool(tail_mask.any()):
+            body_w = weights[body_mask].sum()
+            tail_w = weights[tail_mask].sum()
+            if float(tail_w) > 0.0:
+                tail_scale = min(1.0, float(0.25 * body_w / tail_w))
+                weights = torch.where(tail_mask, weights * tail_scale, weights)
+
+        ce_vec = F.cross_entropy(s_logits.float(), clean, reduction="none")
+        ce_loss = (ce_vec * weights).sum() / weights.sum().clamp_min(1e-6)
+
         kl_loss = torch.zeros((), device=device, dtype=ce_loss.dtype)
         if teacher_targets[p_i] is not None:
             top_p, top_idx = teacher_targets[p_i]
             kl_loss = _topk_forward_kl(
-                s_logits[uncommitted], top_p[uncommitted], top_idx[uncommitted], kl_temp=kl_temp
+                s_logits[frontier_mask], top_p[frontier_mask], top_idx[frontier_mask], kl_temp=kl_temp
             ).mean()
         pt_loss = ce_loss + float(kl_weight) * kl_loss
         ce_sum += float(ce_loss.detach())

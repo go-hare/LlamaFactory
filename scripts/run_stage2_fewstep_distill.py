@@ -76,13 +76,12 @@ def evaluate_fewstep(
                     canvas_size=canvas,
                     pad_id=pad_id,
                     stop_tokens=stop_tokens,
-                    sampler="entropy",
+                    sampler="frontier",
                     temperature=float(settings["sample_temperature"]),
                     multimodal_input=mm_in,
                     use_kv_cache=True,
                     repetition_penalty=float(settings["repetition_penalty"]),
                     defer_adjacent_duplicates=True,
-                    progressive_commit=True,
                 )
                 dt = max(time.perf_counter() - t0, 1e-6)
                 n_tok = int(output.numel())

@@ -15,7 +15,60 @@ from test_qwen3_vl_diffusion import make_mm_prompt, tiny_qwen3_vl
 
 from llamafactory.train.diffusion.adapter import get_diffusion_adapter
 from llamafactory.train.diffusion.loss import _get_conditioner
-from llamafactory.train.diffusion.rl import _commit, few_step_distill_step, sample_canvas
+from llamafactory.train.diffusion.rl import _commit, _frontier_commit_step, few_step_distill_step, sample_canvas
+
+
+def test_frontier_commit_locks_committed_and_advances_left_to_right():
+    vocab_size = 64
+    # Make far-right pos 14..15 slightly lower entropy than pos 2..5, but still > 0.15 so fallback must go left-to-right!
+    logits = torch.zeros(1, 16, vocab_size)
+    logits[0, 14:, 7] = 1.5  # entropy ~ 3.5 > 0.15
+    canvas = torch.full((1, 16), 9, dtype=torch.long)
+    committed = torch.zeros(1, 16, dtype=torch.bool)
+    committed[0, :2] = True  # pos 0..1 already locked to token 9
+
+    next_c, next_comm, _, _ = _frontier_commit_step(
+        logits,
+        canvas,
+        committed,
+        temperature=0.8,
+        entropy_bound=0.15,
+        vocab_size=vocab_size,
+        target_total=6,
+        is_final_step=False,
+    )
+    # Locked tokens 0..1 stay untouched as 9, and fallback advances strictly to pos 2..5 (NOT 14..15).
+    assert torch.equal(next_c[0, :2], torch.tensor([9, 9]))
+    assert bool(next_comm[0, :6].all())
+    assert not bool(next_comm[0, 6:].any())
+
+    # End-to-end sample_canvas(sampler="frontier") with KV cache + multimodal Qwen3-VL works cleanly.
+    model = tiny_qwen3_vl("eager")
+    prompt, mm = make_mm_prompt(3)
+    with torch.no_grad():
+        c, ent = sample_canvas(
+            model,
+            prompt,
+            steps=4,
+            canvas_size=8,
+            pad_id=0,
+            sampler="frontier",
+            multimodal_input=mm,
+            use_kv_cache=True,
+            defer_adjacent_duplicates=True,
+        )
+    assert c.shape == (1, 8)
+    assert torch.isfinite(ent)
+
+
+def test_apply_lora_excludes_self_conditioner():
+    from run_qwen3_conversion_pilot import apply_lora_if_requested
+
+    base = tiny_qwen3_vl("eager", freeze_vision=True)
+    model = apply_lora_if_requested(base, 4, freeze_vision=True)
+    cond = _get_conditioner(model)
+    assert not any("lora" in name for name, _ in cond.named_modules())
+    assert all(p.requires_grad for p in cond.parameters())
 
 
 def test_progressive_commit_guarantees_min_keep_progress():

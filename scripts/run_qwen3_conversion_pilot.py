@@ -610,13 +610,17 @@ def apply_lora_if_requested(model, lora_rank: int, *, freeze_vision: bool = True
     from peft import LoraConfig, TaskType, get_peft_model
 
     adapter = get_diffusion_adapter(model)
-    lora_cfg = LoraConfig(
+    lora_kwargs = dict(
         task_type=TaskType.CAUSAL_LM,
         r=lora_rank,
         lora_alpha=lora_rank * 2,
         lora_dropout=0.0,
         target_modules=adapter.lora_target_modules(model, freeze_vision=freeze_vision),
     )
+    try:
+        lora_cfg = LoraConfig(**lora_kwargs, exclude_modules=r".*self_conditioner.*")
+    except TypeError:
+        lora_cfg = LoraConfig(**lora_kwargs)
     model = get_peft_model(model, lora_cfg)
     if freeze_vision:
         adapter.freeze_vision(model)
