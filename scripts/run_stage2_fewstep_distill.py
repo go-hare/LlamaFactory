@@ -140,6 +140,10 @@ def save_stage2_checkpoint(
         raise FileExistsError(f"Checkpoint already exists: {target}")
     staging.mkdir(parents=True)
     model.save_pretrained(staging)
+    # PEFT writes a README.md with `base_model: <local_path>` that HF Hub rejects on upload.
+    readme_path = staging / "README.md"
+    if readme_path.is_file():
+        readme_path.unlink()
     if hasattr(tokenizer, "save_pretrained"):
         tokenizer.save_pretrained(staging)
     save_file(
@@ -159,18 +163,22 @@ def save_stage2_checkpoint(
     write_json(out / "latest_checkpoint.json", {"path": str(target)})
     print("STAGE2_CHECKPOINT_COMPLETE", target, flush=True)
     if hf_repo:
-        from huggingface_hub import HfApi
+        try:
+            from huggingface_hub import HfApi
 
-        api = HfApi()
-        api.create_repo(repo_id=hf_repo, repo_type="model", private=True, exist_ok=True)
-        api.upload_folder(
-            folder_path=str(target),
-            repo_id=hf_repo,
-            repo_type="model",
-            path_in_repo=target.name,
-            commit_message=f"Stage-2 few-step checkpoint step {step}",
-        )
-        print("HF_CHECKPOINT_UPLOADED", f"{hf_repo}/{target.name}", flush=True)
+            api = HfApi()
+            api.create_repo(repo_id=hf_repo, repo_type="model", private=True, exist_ok=True)
+            api.upload_folder(
+                folder_path=str(target),
+                repo_id=hf_repo,
+                repo_type="model",
+                path_in_repo=target.name,
+                ignore_patterns=["README.md"],
+                commit_message=f"Stage-2 few-step checkpoint step {step}",
+            )
+            print("HF_CHECKPOINT_UPLOADED", f"{hf_repo}/{target.name}", flush=True)
+        except Exception as exc:
+            print("HF_CHECKPOINT_UPLOAD_FAILED", f"{hf_repo}/{target.name}", repr(exc), flush=True)
 
     ckpts = sorted(
         [p for p in out.glob("checkpoint-*") if (p / "COMPLETE").is_file()],
@@ -197,18 +205,22 @@ def export_merged_stage2(model, tokenizer, processor, out: Path, *, hf_repo: str
     (merged_dir / "COMPLETE").write_text("merged_stage2")
     print("STAGE2_MERGED_EXPORTED", merged_dir, flush=True)
     if hf_repo:
-        from huggingface_hub import HfApi
+        try:
+            from huggingface_hub import HfApi
 
-        api = HfApi()
-        api.create_repo(repo_id=hf_repo, repo_type="model", private=True, exist_ok=True)
-        api.upload_folder(
-            folder_path=str(merged_dir),
-            repo_id=hf_repo,
-            repo_type="model",
-            path_in_repo="merged_stage2",
-            commit_message="Stage-2 merged few-step model",
-        )
-        print("HF_MERGED_UPLOADED", f"{hf_repo}/merged_stage2", flush=True)
+            api = HfApi()
+            api.create_repo(repo_id=hf_repo, repo_type="model", private=True, exist_ok=True)
+            api.upload_folder(
+                folder_path=str(merged_dir),
+                repo_id=hf_repo,
+                repo_type="model",
+                path_in_repo="merged_stage2",
+                ignore_patterns=["README.md"],
+                commit_message="Stage-2 merged few-step model",
+            )
+            print("HF_MERGED_UPLOADED", f"{hf_repo}/merged_stage2", flush=True)
+        except Exception as exc:
+            print("HF_MERGED_UPLOAD_FAILED", f"{hf_repo}/merged_stage2", repr(exc), flush=True)
 
 
 def arguments():
@@ -355,14 +367,12 @@ def main():
         flush=True,
     )
 
-    if not args.resume:
-        with preserve_rng():
-            evaluate_fewstep(model, tokenizer, splits, plan, settings, args.out, 0, pad_id=pad_id, stop_tokens=stop_tokens)
+    with preserve_rng():
+        evaluate_fewstep(model, tokenizer, splits, plan, settings, args.out, step, pad_id=pad_id, stop_tokens=stop_tokens)
 
     vision_train = splits.get("vision_train")
     vision_ratio = min(max(float(args.vision_ratio), 0.0), 1.0) if (vision_train and len(vision_train) > 0) else 0.0
     device = next(model.parameters()).device
-    resume_start = step
 
     with (args.out / "train.jsonl").open("a", encoding="utf-8") as log:
         while step < args.max_steps:
@@ -378,7 +388,7 @@ def main():
                 warmup_steps=int(args.warmup_steps),
                 min_lr_ratio=float(args.min_lr_ratio),
                 scheduler="cosine",
-                start_step=resume_start,
+                start_step=0,
             )
             for group in optimizer.param_groups:
                 group["lr"] = lr

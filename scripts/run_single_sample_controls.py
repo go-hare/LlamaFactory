@@ -334,18 +334,22 @@ def save_checkpoint(
     write_json(out / "latest_checkpoint.json", {"path": str(target)})
     print("CHECKPOINT_COMPLETE", target, flush=True)
     if hf_repo:
-        from huggingface_hub import HfApi
+        try:
+            from huggingface_hub import HfApi
 
-        api = HfApi()
-        api.create_repo(repo_id=hf_repo, repo_type="model", private=True, exist_ok=True)
-        api.upload_folder(
-            folder_path=str(target),
-            repo_id=hf_repo,
-            repo_type="model",
-            path_in_repo=target.name,
-            commit_message=f"Checkpoint step {step}",
-        )
-        print("HF_CHECKPOINT_UPLOADED", f"{hf_repo}/{target.name}", flush=True)
+            api = HfApi()
+            api.create_repo(repo_id=hf_repo, repo_type="model", private=True, exist_ok=True)
+            api.upload_folder(
+                folder_path=str(target),
+                repo_id=hf_repo,
+                repo_type="model",
+                path_in_repo=target.name,
+                ignore_patterns=["README.md"],
+                commit_message=f"Checkpoint step {step}",
+            )
+            print("HF_CHECKPOINT_UPLOADED", f"{hf_repo}/{target.name}", flush=True)
+        except Exception as exc:
+            print("HF_CHECKPOINT_UPLOAD_FAILED", f"{hf_repo}/{target.name}", repr(exc), flush=True)
     # Preserve `keep` complete recovery points; never delete an unfinished save.
     checkpoints = sorted(
         [p for p in out.glob("checkpoint-*") if (p / "COMPLETE").is_file()],
