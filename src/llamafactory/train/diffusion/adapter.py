@@ -137,7 +137,12 @@ class DiffusionModelAdapter(Protocol):
         ...
 
     def load_backbone(
-        self, model_name: str, *, dtype: torch.dtype = torch.bfloat16, device: str | torch.device = "cuda"
+        self,
+        model_name: str,
+        *,
+        dtype: torch.dtype = torch.bfloat16,
+        device: str | torch.device = "cuda",
+        processor_name: str | None = None,
     ) -> tuple[nn.Module, Any, Any]:
         """Load ``(model, tokenizer, processor_or_none)`` for this backbone family."""
         ...
@@ -270,11 +275,16 @@ class StandardCausalAdapter:
         return torch.arange(canvas_len, device=device, dtype=torch.long)[None, :] + next_pos
 
     def load_backbone(
-        self, model_name: str, *, dtype: torch.dtype = torch.bfloat16, device: str | torch.device = "cuda"
+        self,
+        model_name: str,
+        *,
+        dtype: torch.dtype = torch.bfloat16,
+        device: str | torch.device = "cuda",
+        processor_name: str | None = None,
     ) -> tuple[nn.Module, Any, Any]:
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        tokenizer = AutoTokenizer.from_pretrained(processor_name or model_name)
         model = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype).to(device)
         return model, tokenizer, None
 
@@ -432,11 +442,16 @@ class Gemma4Adapter:
         raise NotImplementedError("Gemma4Adapter uses sliding-window attention and does not support DiffusionHistoryCache.")
 
     def load_backbone(
-        self, model_name: str, *, dtype: torch.dtype = torch.bfloat16, device: str | torch.device = "cuda"
+        self,
+        model_name: str,
+        *,
+        dtype: torch.dtype = torch.bfloat16,
+        device: str | torch.device = "cuda",
+        processor_name: str | None = None,
     ) -> tuple[nn.Module, Any, Any]:
         from transformers import AutoModelForImageTextToText, AutoProcessor
 
-        processor = AutoProcessor.from_pretrained(model_name)
+        processor = AutoProcessor.from_pretrained(processor_name or model_name)
         tokenizer = getattr(processor, "tokenizer", processor)
         model = AutoModelForImageTextToText.from_pretrained(model_name, dtype=dtype).to(device)
         return model, tokenizer, processor
@@ -694,11 +709,16 @@ class Qwen3VLAdapter(StandardCausalAdapter):
         return text_pos
 
     def load_backbone(
-        self, model_name: str, *, dtype: torch.dtype = torch.bfloat16, device: str | torch.device = "cuda"
+        self,
+        model_name: str,
+        *,
+        dtype: torch.dtype = torch.bfloat16,
+        device: str | torch.device = "cuda",
+        processor_name: str | None = None,
     ) -> tuple[nn.Module, Any, Any]:
         from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
-        processor = AutoProcessor.from_pretrained(model_name)
+        processor = AutoProcessor.from_pretrained(processor_name or model_name)
         tokenizer = getattr(processor, "tokenizer", processor)
         model = Qwen3VLForConditionalGeneration.from_pretrained(model_name, dtype=dtype).to(device)
         return model, tokenizer, processor
@@ -809,12 +829,18 @@ def get_diffusion_adapter(model) -> DiffusionModelAdapter:
 
 
 def load_diffusion_backbone(
-    model_name: str, *, dtype: torch.dtype = torch.bfloat16, device: str | torch.device = "cuda"
+    model_name: str,
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+    device: str | torch.device = "cuda",
+    processor_name: str | None = None,
 ) -> tuple[nn.Module, Any, Any, DiffusionModelAdapter]:
     """Resolve adapter from HF config and load ``(model, tokenizer, processor, adapter)``."""
     from transformers import AutoConfig
 
     cfg = AutoConfig.from_pretrained(model_name)
     adapter = get_diffusion_adapter(cfg)
-    model, tokenizer, processor = adapter.load_backbone(model_name, dtype=dtype, device=device)
+    model, tokenizer, processor = adapter.load_backbone(
+        model_name, dtype=dtype, device=device, processor_name=processor_name
+    )
     return model, tokenizer, processor, adapter

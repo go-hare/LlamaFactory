@@ -158,3 +158,47 @@ def test_stage2_fewstep_cli_tiny_vl_train_resume_and_export(tmp_path):
     assert res2.returncode == 0, res2.stdout + res2.stderr
     assert "STAGE2_RESUMED" in res2.stdout
     assert (resumed / "checkpoint-2/COMPLETE").read_text() == "2"
+
+
+def test_load_diffusion_backbone_supports_separate_processor_name(monkeypatch):
+    import transformers
+    from types import SimpleNamespace
+
+    from llamafactory.train.diffusion.adapter import load_diffusion_backbone
+
+    seen = {}
+
+    class DummyModel:
+        def to(self, device):
+            seen["device"] = device
+            return self
+
+    fake_cfg = SimpleNamespace(model_type="qwen3_vl")
+    monkeypatch.setattr(transformers.AutoConfig, "from_pretrained", classmethod(lambda cls, p: seen.setdefault("cfg", p) and fake_cfg))
+    monkeypatch.setattr(
+        transformers.AutoProcessor,
+        "from_pretrained",
+        classmethod(lambda cls, p: seen.setdefault("processor", p) and SimpleNamespace(tokenizer="tok")),
+    )
+    monkeypatch.setattr(
+        transformers.Qwen3VLForConditionalGeneration,
+        "from_pretrained",
+        classmethod(lambda cls, p, dtype=None: seen.setdefault("model", p) and DummyModel()),
+    )
+
+    model, tok, proc, adapter = load_diffusion_backbone(
+        "/tmp/local-stage1-ckpt",
+        dtype=torch.bfloat16,
+        device="cpu",
+        processor_name="Qwen/Qwen3-VL-4B-Thinking",
+    )
+    assert isinstance(model, DummyModel)
+    assert tok == "tok"
+    assert proc.tokenizer == "tok"
+    assert adapter.name == "qwen3_vl"
+    assert seen == {
+        "cfg": "/tmp/local-stage1-ckpt",
+        "processor": "Qwen/Qwen3-VL-4B-Thinking",
+        "model": "/tmp/local-stage1-ckpt",
+        "device": "cpu",
+    }

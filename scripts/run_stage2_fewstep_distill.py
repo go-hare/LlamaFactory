@@ -269,11 +269,12 @@ def main():
         adapter = get_diffusion_adapter(model)
         canvas_size = 16
     else:
-        from transformers import AutoProcessor
-
-        model, _, _, adapter = load_diffusion_backbone(args.stage1_ckpt, dtype=torch.bfloat16, device="cuda")
-        processor = AutoProcessor.from_pretrained(args.processor_model)
-        tokenizer = getattr(processor, "tokenizer", processor)
+        model, tokenizer, processor, adapter = load_diffusion_backbone(
+            args.stage1_ckpt,
+            dtype=torch.bfloat16,
+            device="cuda",
+            processor_name=args.processor_model,
+        )
         splits = load_qwen3_splits(args.data, tokenizer)
         if args.vision_data is not None:
             v_splits = load_vision_splits(args.vision_data, processor)
