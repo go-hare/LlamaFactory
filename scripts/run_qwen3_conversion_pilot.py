@@ -144,10 +144,23 @@ class LazyQwen3Split:
         }
 
 
-def load_qwen3_splits(directory: Path, tokenizer, *, prompt_cap: int = 4096, response_cap: int = 18 * 256):
+def load_qwen3_splits(
+    directory: Path,
+    tokenizer,
+    *,
+    prompt_cap: int = 4096,
+    response_cap: int = 18 * 256,
+    train_prompt_cap: int | None = None,
+    train_response_cap: int | None = None,
+):
     return {
-        split: LazyQwen3Split(directory / f"{split}.jsonl", tokenizer, prompt_cap=prompt_cap, response_cap=response_cap)
-        for split in ("valid", "train")
+        "valid": LazyQwen3Split(directory / "valid.jsonl", tokenizer, prompt_cap=prompt_cap, response_cap=response_cap),
+        "train": LazyQwen3Split(
+            directory / "train.jsonl",
+            tokenizer,
+            prompt_cap=train_prompt_cap or prompt_cap,
+            response_cap=train_response_cap or response_cap,
+        ),
     }
 
 
@@ -263,12 +276,20 @@ class LazyQwen3VLSplit:
         }
 
 
-def load_vision_splits(directory: Path, processor, *, prompt_cap: int = 4096, response_cap: int = 18 * 256):
+def load_vision_splits(
+    directory: Path,
+    processor,
+    *,
+    prompt_cap: int = 4096,
+    response_cap: int = 18 * 256,
+    train_response_cap: int | None = None,
+):
     out = {}
     for split in ("valid", "train"):
         p = directory / f"{split}.jsonl"
         if p.is_file():
-            out[split] = LazyQwen3VLSplit(p, processor, prompt_cap=prompt_cap, response_cap=response_cap)
+            r_cap = (train_response_cap or response_cap) if split == "train" else response_cap
+            out[split] = LazyQwen3VLSplit(p, processor, prompt_cap=prompt_cap, response_cap=r_cap)
     return out
 
 
@@ -683,6 +704,8 @@ def arguments():
     parser.add_argument("--micro-batch", type=int, default=1, help="Rows packed per GPU forward pass")
     parser.add_argument("--grad-accum", type=int, default=16)
     parser.add_argument("--max-batch-tokens", type=int, default=12288, help="OOM guard on padded micro-batch tokens")
+    parser.add_argument("--train-prompt-cap", type=int, default=4096, help="Hard cap on text train prompt tokens (keeps valid untouched)")
+    parser.add_argument("--train-response-cap", type=int, default=18 * 256, help="Hard cap on train response tokens (bounds worst-case O(L^2) attention)")
     parser.add_argument("--no-grad-ckpt", action="store_true", help="Disable gradient checkpointing to trade VRAM for speed")
     parser.add_argument("--eval-every", type=int, default=256)
     parser.add_argument("--generation-every", type=int, default=256)
@@ -769,11 +792,16 @@ def main():
         model, tokenizer, processor, adapter = load_diffusion_backbone(
             args.model, dtype=torch.bfloat16, device="cuda", processor_name=args.processor_model
         )
-        splits = load_qwen3_splits(args.data, tokenizer)
+        splits = load_qwen3_splits(
+            args.data,
+            tokenizer,
+            train_prompt_cap=args.train_prompt_cap,
+            train_response_cap=args.train_response_cap,
+        )
         if args.vision_data is not None:
             if processor is None:
                 raise RuntimeError(f"--vision-data requires a multimodal processor, but {args.model} loaded without one.")
-            v_splits = load_vision_splits(args.vision_data, processor)
+            v_splits = load_vision_splits(args.vision_data, processor, train_response_cap=args.train_response_cap)
             if "train" in v_splits:
                 splits["vision_train"] = v_splits["train"]
             if "valid" in v_splits:
