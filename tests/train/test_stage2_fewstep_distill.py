@@ -15,7 +15,73 @@ from test_qwen3_vl_diffusion import make_mm_prompt, tiny_qwen3_vl
 
 from llamafactory.train.diffusion.adapter import get_diffusion_adapter
 from llamafactory.train.diffusion.loss import _get_conditioner
-from llamafactory.train.diffusion.rl import _commit, _frontier_commit_step, few_step_distill_step, sample_canvas
+from llamafactory.train.diffusion.rl import (
+    _commit,
+    _dynamic_parallel_step,
+    _frontier_commit_step,
+    few_step_distill_step,
+    sample_canvas,
+)
+
+
+def test_dynamic_parallel_step_branch_fallback_and_confident_parallel_unlock():
+    vocab_size = 64
+    canvas = torch.full((1, 16), 9, dtype=torch.long)
+    committed = torch.zeros(1, 16, dtype=torch.bool)
+    committed[0, :2] = True
+
+    # Case 1: Branch point (uniform logits, no token meets tau=0.75) -> commits ONLY pos 2 (1 token!).
+    logits_flat = torch.zeros(1, 16, vocab_size)
+    next_c, next_comm, _, _ = _dynamic_parallel_step(
+        logits_flat,
+        canvas,
+        committed,
+        temperature=0.5,
+        confidence_threshold=0.75,
+        frontier_window=8,
+        vocab_size=vocab_size,
+    )
+    assert torch.equal(next_c[0, :2], torch.tensor([9, 9]))
+    assert bool(next_comm[0, :3].all())
+    assert not bool(next_comm[0, 3:].any())
+
+    # Case 2: High-confidence span at pos 2..5 (inside window) & pos 14 (outside window) -> unlocks 2..5 in parallel, skips 14.
+    logits_sharp = torch.zeros(1, 16, vocab_size)
+    logits_sharp[0, 2:6, 11] = 10.0
+    logits_sharp[0, 14, 12] = 10.0
+    _, next_comm2, _, _ = _dynamic_parallel_step(
+        logits_sharp,
+        canvas,
+        committed,
+        temperature=0.5,
+        confidence_threshold=0.75,
+        frontier_window=8,
+        vocab_size=vocab_size,
+    )
+    assert bool(next_comm2[0, :6].all())
+    assert not bool(next_comm2[0, 14])
+
+    # End-to-end sample_canvas(sampler="dynamic") with KV cache + multimodal Qwen3-VL works cleanly.
+    model = tiny_qwen3_vl("eager")
+    prompt, mm = make_mm_prompt(3)
+    with torch.no_grad():
+        c, ent = sample_canvas(
+            model,
+            prompt,
+            steps=8,
+            canvas_size=8,
+            pad_id=0,
+            sampler="dynamic",
+            temperature=0.5,
+            multimodal_input=mm,
+            use_kv_cache=True,
+            defer_adjacent_duplicates=True,
+            confidence_threshold=0.75,
+            frontier_window=8,
+            exempt_tokens=(1,),
+        )
+    assert c.shape == (1, 8)
+    assert torch.isfinite(ent)
 
 
 def test_frontier_commit_locks_committed_and_advances_left_to_right():

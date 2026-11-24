@@ -184,6 +184,66 @@ def _frontier_commit_step(
     return next_canvas, next_committed, scaled, entropy
 
 
+def _dynamic_parallel_step(
+    logits: torch.Tensor,
+    canvas: torch.Tensor,
+    committed: torch.Tensor,
+    *,
+    temperature: float,
+    confidence_threshold: float,
+    frontier_window: int,
+    vocab_size: int,
+    is_final_step: bool = False,
+    defer_adjacent_duplicates: bool = False,
+    exempt_tokens: tuple[int, ...] = (),
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fast-dLLM-style confidence-threshold parallel commit with 1-token branch-point fallback."""
+    scaled = logits.float() / max(temperature, 1e-6)
+    log_probs = torch.log_softmax(scaled, dim=-1)
+    probs = torch.exp(log_probs)
+    safe_log_probs = torch.where(probs == 0, torch.zeros_like(log_probs), log_probs)
+    entropy = -(safe_log_probs * probs).sum(dim=-1)
+    drawn = torch.multinomial(probs.view(-1, probs.shape[-1]), 1).view(canvas.shape)
+    conf = probs.gather(-1, drawn.unsqueeze(-1)).squeeze(-1)
+
+    if is_final_step:
+        new_commit = ~committed
+    else:
+        uncomm = ~committed
+        new_commit = torch.zeros_like(committed)
+        win = max(1, int(frontier_window))
+        tau = float(confidence_threshold)
+        for b in range(canvas.shape[0]):
+            uncomm_pos = uncomm[b].nonzero(as_tuple=False).flatten()
+            if uncomm_pos.numel() == 0:
+                continue
+            frontier_start = int(uncomm_pos[0].item())
+            in_win = torch.zeros_like(uncomm[b])
+            in_win[frontier_start : min(canvas.shape[1], frontier_start + win)] = True
+            cand = uncomm[b] & in_win & (conf[b] >= tau)
+            if not bool(cand.any()):
+                cand[frontier_start] = True
+            new_commit[b] = cand
+        if defer_adjacent_duplicates and canvas.shape[1] >= 2:
+            left_tok = torch.where(committed[:, :-1], canvas[:, :-1], drawn[:, :-1])
+            same_left = drawn[:, 1:] == left_tok
+            both = (committed[:, :-1] | new_commit[:, :-1]) & new_commit[:, 1:]
+            conflict = both & same_left
+            for ex in exempt_tokens:
+                conflict = conflict & (drawn[:, 1:] != int(ex))
+            new_commit[:, 1:] = new_commit[:, 1:] & (~conflict)
+            for b in range(canvas.shape[0]):
+                if not bool(new_commit[b].any()):
+                    uncomm_pos = (~committed[b]).nonzero(as_tuple=False).flatten()
+                    if uncomm_pos.numel() > 0:
+                        new_commit[b, int(uncomm_pos[0].item())] = True
+
+    noise = torch.randint(0, vocab_size, canvas.shape, device=canvas.device)
+    next_canvas = torch.where(committed, canvas, torch.where(new_commit, drawn, noise))
+    next_committed = committed | new_commit
+    return next_canvas, next_committed, scaled, entropy
+
+
 def _ddim_step(
     logits: torch.Tensor,
     canvas: torch.Tensor,
@@ -358,9 +418,11 @@ def sample_canvas(
     exempt_tokens: tuple[int, ...] = (),
     defer_adjacent_duplicates: bool = False,
     progressive_commit: bool = False,
+    confidence_threshold: float = 0.75,
+    frontier_window: int = 32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Denoise one canvas from uniform noise or [MASK] prior with carried self-conditioning."""
-    if sampler not in ("entropy", "frontier", "ddim", "mask", "remdm", "rcd"):
+    if sampler not in ("entropy", "frontier", "dynamic", "ddim", "mask", "remdm", "rcd"):
         raise ValueError(f"Unknown diffusion sampler: {sampler}")
     if sampler in ("mask", "remdm", "rcd") and mask_id is None:
         raise ValueError(f"sampler={sampler!r} requires an explicit mask_id.")
@@ -409,7 +471,20 @@ def sample_canvas(
             logits = _apply_local_repetition_penalty(
                 logits, canvas, penalty=repetition_penalty, exempt_tokens=rep_exempt
             )
-        if sampler == "frontier":
+        if sampler == "dynamic":
+            next_canvas, committed, shaped_logits, token_entropy = _dynamic_parallel_step(
+                logits,
+                canvas,
+                committed,
+                temperature=temperature,
+                confidence_threshold=confidence_threshold,
+                frontier_window=frontier_window,
+                vocab_size=vocab_size,
+                is_final_step=is_final_step,
+                defer_adjacent_duplicates=defer_adjacent_duplicates,
+                exempt_tokens=rep_exempt,
+            )
+        elif sampler == "frontier":
             next_canvas, committed, shaped_logits, token_entropy = _frontier_commit_step(
                 logits,
                 canvas,
@@ -475,13 +550,26 @@ def sample_canvas(
                 protect_stop_time=protect_stop_time,
             )
         mean_entropy = token_entropy.mean()
-        if sampler == "frontier":
+        if sampler in ("frontier", "dynamic"):
             sc_embeddings = _aligned_sc(
                 token_embedding, next_canvas, committed, shaped_logits, scale=embed_scale
             )
-            if early_stop and bool(committed.all()):
-                canvas = next_canvas
-                break
+            if early_stop:
+                hit_prefix_stop = False
+                if exempt_tokens:
+                    stop_set_local = {int(t) for t in exempt_tokens if int(t) != int(pad_id)}
+                    if stop_set_local:
+                        comm_list = committed[0].tolist()
+                        tok_list = next_canvas[0].tolist()
+                        for idx in range(canvas_size):
+                            if not comm_list[idx]:
+                                break
+                            if tok_list[idx] in stop_set_local:
+                                hit_prefix_stop = True
+                                break
+                if hit_prefix_stop or bool(committed.all()):
+                    canvas = next_canvas
+                    break
         elif sampler == "rcd":
             sc_embeddings = rcd_residual_signal(
                 token_embedding,
@@ -494,7 +582,7 @@ def sample_canvas(
             sc_embeddings = _embed_distribution(token_embedding, shaped_logits, scale=embed_scale)
         stable = bool((shaped_logits.argmax(dim=-1) == canvas).all())
         confident = bool(mean_entropy <= entropy_threshold)
-        if sampler != "frontier" and early_stop and stable and confident and not (sampler in ("mask", "remdm", "rcd") and bool((next_canvas == int(mask_id)).any())):
+        if sampler not in ("frontier", "dynamic") and early_stop and stable and confident and not (sampler in ("mask", "remdm", "rcd") and bool((next_canvas == int(mask_id)).any())):
             canvas = next_canvas
             break
         canvas = next_canvas
@@ -522,6 +610,8 @@ def sample_response(
     repetition_penalty: float = 1.0,
     defer_adjacent_duplicates: bool = False,
     progressive_commit: bool = False,
+    confidence_threshold: float = 0.75,
+    frontier_window: int = 32,
 ) -> torch.Tensor:
     """Block-autoregressive generation across canvases, truncating at the first stop token."""
     running_prompt = prompt.view(-1)
@@ -552,6 +642,8 @@ def sample_response(
             exempt_tokens=stop_tokens,
             defer_adjacent_duplicates=defer_adjacent_duplicates,
             progressive_commit=progressive_commit,
+            confidence_threshold=confidence_threshold,
+            frontier_window=frontier_window,
         )
         row = canvas[0]
         hit_idx = None
