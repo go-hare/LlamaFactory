@@ -704,6 +704,7 @@ def arguments():
     parser.add_argument("--micro-batch", type=int, default=1, help="Rows packed per GPU forward pass")
     parser.add_argument("--grad-accum", type=int, default=16)
     parser.add_argument("--max-batch-tokens", type=int, default=12288, help="OOM guard on padded micro-batch tokens")
+    parser.add_argument("--max-train-seq-tokens", type=int, default=0, help="Skip (never truncate) individual training rows whose worst-case sequence exceeds this limit (0 = unlimited)")
     parser.add_argument("--train-prompt-cap", type=int, default=4096, help="Hard cap on text train prompt tokens (keeps valid untouched)")
     parser.add_argument("--train-response-cap", type=int, default=18 * 256, help="Hard cap on train response tokens (bounds worst-case O(L^2) attention)")
     parser.add_argument("--no-grad-ckpt", action="store_true", help="Disable gradient checkpointing to trade VRAM for speed")
@@ -944,6 +945,9 @@ def main():
     device = next(model.parameters()).device
     block_counts = Counter()
     resume_start = step
+    text_skip = 0
+    vis_skip = 0
+    max_seq_cap = int(args.max_train_seq_tokens)
     with (args.out / "train.jsonl").open("a", encoding="utf-8") as log:
         while step < args.max_steps:
             started = time.perf_counter()
@@ -976,23 +980,33 @@ def main():
             for offset in range(effective_batch):
                 micro = (step - 1) * effective_batch + offset
                 use_vision_row = vision_train is not None and offset < n_vision_rows
-                if use_vision_row:
-                    v_micro = (step - 1) * max(n_vision_rows, 1) + offset
-                    index = schedule_index(v_micro, len(vision_train), seed=1337)
-                    row_obj = vision_train[index]
-                    row_id = f"v:{index}"
-                else:
-                    index = schedule_index(micro + args.data_offset, len(splits["train"]))
-                    row_obj = splits["train"][index]
-                    row_id = index
+                for _attempt in range(64):
+                    if use_vision_row:
+                        v_micro = (step - 1) * max(n_vision_rows, 1) + offset + vis_skip
+                        index = schedule_index(v_micro, len(vision_train), seed=1337)
+                        row_obj = vision_train[index]
+                        row_id = f"v:{index}"
+                    else:
+                        index = schedule_index(micro + args.data_offset + text_skip, len(splits["train"]))
+                        row_obj = splits["train"][index]
+                        row_id = index
+                    p_len_raw = len(row_obj["prompt_ids"])
+                    t_len_raw = len(row_obj["response_ids"])
+                    if args.training_mode == "all-blocks":
+                        n_active = min(max(1, (t_len_raw + canvas - 1) // canvas), 18)
+                        n_sel = min(n_active, max(1, args.max_train_blocks))
+                        est_len = int(p_len_raw + (n_active - 1) * canvas + n_sel * canvas)
+                    else:
+                        est_len = int(p_len_raw + min(t_len_raw, canvas * 18) // 2 + canvas)
+                    if max_seq_cap > 0 and est_len > max_seq_cap:
+                        if use_vision_row:
+                            vis_skip += 1
+                        else:
+                            text_skip += 1
+                        continue
+                    break
                 prompt, target = tensor_row(row_obj, device)
                 mm_in = row_obj.get("multimodal")
-                if args.training_mode == "all-blocks":
-                    n_active = min(max(1, (target.numel() + canvas - 1) // canvas), 18)
-                    n_sel = min(n_active, max(1, args.max_train_blocks))
-                    est_len = int(prompt.numel() + (n_active - 1) * canvas + n_sel * canvas)
-                else:
-                    est_len = int(prompt.numel() + min(target.numel(), canvas * 18) // 2 + canvas)
                 step_items.append((micro, row_id, prompt, target, est_len, mm_in))
             if args.micro_batch > 1:
                 step_items.sort(key=lambda item: item[4])
