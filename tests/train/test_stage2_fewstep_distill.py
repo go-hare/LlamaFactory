@@ -61,6 +61,22 @@ def test_dynamic_parallel_step_branch_fallback_and_confident_parallel_unlock():
     assert bool(next_comm2[0, :6].all())
     assert not bool(next_comm2[0, 14])
 
+    # Case 3: Weak 2-way tie (~50% raw prob) MUST NOT be inflated past tau=0.75 by low temperature=0.2!
+    logits_tie = torch.full((1, 16, vocab_size), -20.0)
+    logits_tie[0, 2:6, 11] = 0.2
+    logits_tie[0, 2:6, 12] = 0.0  # raw softmax prob of 11 is ~0.55 < 0.75, even though T=0.2 gives ~0.73..0.85
+    _, next_comm3, _, _ = _dynamic_parallel_step(
+        logits_tie,
+        canvas,
+        committed,
+        temperature=0.2,
+        confidence_threshold=0.75,
+        frontier_window=8,
+        vocab_size=vocab_size,
+    )
+    assert bool(next_comm3[0, :3].all())
+    assert not bool(next_comm3[0, 3:].any())
+
     # End-to-end sample_canvas(sampler="dynamic") with KV cache + multimodal Qwen3-VL works cleanly.
     model = tiny_qwen3_vl("eager")
     prompt, mm = make_mm_prompt(3)

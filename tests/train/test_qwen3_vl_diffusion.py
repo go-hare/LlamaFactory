@@ -464,3 +464,128 @@ def test_qwen3_vl_pilot_cli_tiny_vl_all_blocks_and_resume(tmp_path):
     assert res4.returncode == 0, res4.stdout + res4.stderr
     assert "RESUME_FRESH_OPTIMIZER" in res4.stdout
     assert (light_res / "checkpoint-2/COMPLETE").read_text() == "2"
+
+
+def test_qwen3_vl_multimodal_ar_teacher_kl_and_stage15_resume(tmp_path):
+    """Verify multimodal AR-teacher top-K forward KL on mixed batches and Stage-1.5 CLI resume."""
+    student = tiny_qwen3_vl("eager", freeze_vision=True).train()
+    teacher = tiny_qwen3_vl("eager", freeze_vision=True).eval()
+    for p in teacher.parameters():
+        p.requires_grad_(False)
+
+    p_img, mm = make_mm_prompt(17)
+    p_txt = torch.tensor([5, 6, 7, 8, 9, 10], dtype=torch.long)
+    r_img = torch.tensor([11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 1], dtype=torch.long)
+    r_txt = torch.tensor([21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 1], dtype=torch.long)
+
+    torch.manual_seed(0)
+    loss, parts = diffusion_all_blocks_step(
+        student,
+        [p_img, p_txt],
+        [r_img, r_txt],
+        canvas_size=8,
+        num_canvases=4,
+        pad_id=0,
+        eos_id=1,
+        loss_mode="tail-capped",
+        max_train_blocks=2,
+        ar_teacher=teacher,
+        kl_weight=0.5,
+        kl_topk=16,
+        kl_temp=1.0,
+        multimodal_inputs=[mm, None],
+    )
+    assert torch.isfinite(loss)
+    assert parts["kl_loss"] >= 0.0
+    loss.backward()
+    assert all(p.grad is None for p in student.model.visual.parameters())
+    assert all(p.grad is None for p in teacher.parameters())
+    assert any(p.grad is not None and torch.count_nonzero(p.grad) > 0 for p in student.model.language_model.parameters())
+
+    # End-to-end Stage-1.5 CLI check: Stage-1 checkpoint -> resume with --ar-teacher + --kl-weight 0.5 + --sampler dynamic!
+    s1_out = tmp_path / "stage1_base"
+    cmd1 = [
+        sys.executable,
+        str(SCRIPTS / "run_qwen3_conversion_pilot.py"),
+        "--tiny-vl",
+        "--lora-rank",
+        "0",
+        "--optimizer-mode",
+        "gpu-adamw",
+        "--training-mode",
+        "all-blocks",
+        "--loss-mode",
+        "tail-capped",
+        "--sampler",
+        "entropy",
+        "--no-save-optimizer",
+        "--out",
+        str(s1_out),
+        "--max-steps",
+        "1",
+        "--eval-every",
+        "1",
+        "--generation-every",
+        "1",
+        "--micro-batch",
+        "2",
+        "--grad-accum",
+        "1",
+        "--sample-steps",
+        "2",
+        "--generation-canvases",
+        "1",
+    ]
+    r1 = subprocess.run(cmd1, capture_output=True, text=True, timeout=180)
+    assert r1.returncode == 0, r1.stdout + r1.stderr
+
+    s15_out = tmp_path / "stage15_ar_kl"
+    cmd15 = [
+        sys.executable,
+        str(SCRIPTS / "run_qwen3_conversion_pilot.py"),
+        "--tiny-vl",
+        "--lora-rank",
+        "0",
+        "--optimizer-mode",
+        "gpu-adamw",
+        "--training-mode",
+        "all-blocks",
+        "--loss-mode",
+        "tail-capped",
+        "--ar-teacher",
+        "tiny",
+        "--kl-weight",
+        "0.5",
+        "--kl-topk",
+        "16",
+        "--sampler",
+        "dynamic",
+        "--confidence-threshold",
+        "0.70",
+        "--vision-ratio",
+        "0.5",
+        "--no-save-optimizer",
+        "--resume",
+        str(s1_out / "checkpoint-1"),
+        "--out",
+        str(s15_out),
+        "--max-steps",
+        "2",
+        "--eval-every",
+        "1",
+        "--generation-every",
+        "1",
+        "--micro-batch",
+        "2",
+        "--grad-accum",
+        "1",
+        "--sample-steps",
+        "4",
+        "--generation-canvases",
+        "1",
+    ]
+    r2 = subprocess.run(cmd15, capture_output=True, text=True, timeout=180)
+    assert r2.returncode == 0, r2.stdout + r2.stderr
+    assert "AR_TEACHER_LOADED" in r2.stdout
+    assert "RESUME_FRESH_OPTIMIZER" in r2.stdout
+    assert (s15_out / "checkpoint-2/COMPLETE").read_text() == "2"

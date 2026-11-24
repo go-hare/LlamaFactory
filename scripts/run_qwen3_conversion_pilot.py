@@ -341,6 +341,8 @@ def sample_pilot_response(
     use_kv = bool(settings.get("use_kv_cache", True)) and supports_history_kv_cache(model)
     rep_pen = float(settings.get("repetition_penalty", 1.0))
     defer_dup = bool(settings.get("defer_adjacent_dup", False))
+    conf_tau = float(settings.get("confidence_threshold", 0.70))
+    f_win = int(settings.get("frontier_window", 32))
     gen_canvas = int(settings.get("eval_canvas") or 0) or int(settings["canvas"])
     history_cache = None
     if use_kv:
@@ -368,6 +370,8 @@ def sample_pilot_response(
                 repetition_penalty=rep_pen,
                 exempt_tokens=stop_tokens,
                 defer_adjacent_duplicates=defer_dup,
+                confidence_threshold=conf_tau,
+                frontier_window=f_win,
             )
             row = canvas[0]
             hit_idx = next((idx for idx, tid in enumerate(row.tolist()) if tid in stop_set), None)
@@ -390,15 +394,21 @@ def sample_pilot_response(
                 multimodal_input=multimodal_input,
                 repetition_penalty=rep_pen,
                 defer_adjacent_duplicates=defer_dup,
+                confidence_threshold=conf_tau,
+                frontier_window=f_win,
             )
         chunks.append(chunk)
+        tot_tok = sum(len(c) for c in chunks)
+        elapsed = max(time.perf_counter() - started, 1e-6)
         print(
             "GENERATION_BLOCK",
             block + 1,
             "tokens",
-            sum(len(c) for c in chunks),
+            tot_tok,
             "seconds",
-            round(time.perf_counter() - started, 2),
+            round(elapsed, 2),
+            "tok_per_s",
+            round(tot_tok / elapsed, 1),
             flush=True,
         )
         if len(chunk) and int(chunk[-1]) in stop_set:
@@ -666,6 +676,7 @@ def compute_lr(
 def arguments():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="Qwen/Qwen3-8B")
+    parser.add_argument("--processor-model", type=str, default=None, help="Optional base HF model for tokenizer/processor config")
     parser.add_argument("--data", type=Path, default=ROOT / "data/real_conversion_pilot_v1")
     parser.add_argument("--out", type=Path, default=Path("/content/drive/MyDrive/saves/qwen3_8b_conversion_v1"))
     parser.add_argument("--max-steps", type=int, default=512)
@@ -678,7 +689,9 @@ def arguments():
     parser.add_argument("--generation-canvases", type=int, default=18)
     parser.add_argument("--generation-seconds", type=int, default=120)
     parser.add_argument("--sample-steps", type=int, default=64)
-    parser.add_argument("--sampler", choices=["ddim", "mask", "remdm", "rcd", "entropy"], default="ddim")
+    parser.add_argument("--sampler", choices=["ddim", "mask", "remdm", "rcd", "entropy", "frontier", "dynamic"], default="ddim")
+    parser.add_argument("--confidence-threshold", type=float, default=0.70, help="Raw T=1.0 confidence threshold for dynamic sampler")
+    parser.add_argument("--frontier-window", type=int, default=32, help="Lookahead window for dynamic sampler")
     parser.add_argument("--residual-mode", choices=["standard", "rcd"], default="standard")
     parser.add_argument("--remask-eta", type=float, default=0.08)
     parser.add_argument("--eval-only", action="store_true")
@@ -753,7 +766,9 @@ def main():
         model, tokenizer, splits = tiny_setup()
         adapter = get_diffusion_adapter(model)
     else:
-        model, tokenizer, processor, adapter = load_diffusion_backbone(args.model, dtype=torch.bfloat16, device="cuda")
+        model, tokenizer, processor, adapter = load_diffusion_backbone(
+            args.model, dtype=torch.bfloat16, device="cuda", processor_name=args.processor_model
+        )
         splits = load_qwen3_splits(args.data, tokenizer)
         if args.vision_data is not None:
             if processor is None:
@@ -767,11 +782,15 @@ def main():
 
     ar_teacher = None
     if args.ar_teacher and args.kl_weight > 0.0 and not args.eval_only:
-        if is_tiny:
+        if args.tiny_vl:
+            ar_teacher, _, _ = tiny_vl_setup()
+            ar_teacher = ar_teacher.to(next(model.parameters()).device).eval()
+        elif args.tiny:
             ar_teacher, _, _ = tiny_setup()
             ar_teacher = ar_teacher.to(next(model.parameters()).device).eval()
         else:
-            ar_teacher = AutoModelForCausalLM.from_pretrained(args.ar_teacher, dtype=torch.bfloat16).cuda().eval()
+            ar_teacher, _, _, _ = load_diffusion_backbone(args.ar_teacher, dtype=torch.bfloat16, device="cuda")
+            ar_teacher = ar_teacher.eval()
         for param in ar_teacher.parameters():
             param.requires_grad_(False)
         print("AR_TEACHER_LOADED", {"model": args.ar_teacher, "kl_weight": args.kl_weight, "kl_topk": args.kl_topk, "kl_temp": args.kl_temp}, flush=True)
@@ -847,7 +866,7 @@ def main():
             if any(restored["settings"].get(k) != settings.get(k) for k in compat_keys):
                 raise RuntimeError("Checkpoint model/tokenizer settings differ; cannot load")
         elif restored["settings"] != settings:
-            compat_keys = ("model", "lora_rank", "pad_id", "eos_id", "sampler")
+            compat_keys = ("model", "lora_rank", "pad_id", "eos_id")
             if any(restored["settings"].get(k) != settings.get(k) for k in compat_keys):
                 raise RuntimeError("Checkpoint settings/code differ; no model loaded")
         if args.lora_rank > 0:
@@ -1035,7 +1054,7 @@ def main():
             }
             log.write(json.dumps(record) + "\n")
             log.flush()
-            if step == 1 or step % 10 == 0:
+            if step == 1 or step == resume_start + 1 or step % 10 == 0:
                 print("TRAIN", json.dumps(record), flush=True)
             if step % args.eval_every == 0 or step == args.max_steps:
                 optimizer.zero_grad(set_to_none=True)
@@ -1048,6 +1067,7 @@ def main():
                     keep=args.keep_checkpoints,
                     save_optimizer=not bool(args.no_save_optimizer),
                     hf_repo=args.hf_repo,
+                    processor=processor,
                 )
                 with preserve_rng():
                     evaluate(

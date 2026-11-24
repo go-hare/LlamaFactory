@@ -198,13 +198,16 @@ def _dynamic_parallel_step(
     exempt_tokens: tuple[int, ...] = (),
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fast-dLLM-style confidence-threshold parallel commit with 1-token branch-point fallback."""
-    scaled = logits.float() / max(temperature, 1e-6)
+    logits_f = logits.float()
+    scaled = logits_f / max(temperature, 1e-6)
     log_probs = torch.log_softmax(scaled, dim=-1)
     probs = torch.exp(log_probs)
     safe_log_probs = torch.where(probs == 0, torch.zeros_like(log_probs), log_probs)
     entropy = -(safe_log_probs * probs).sum(dim=-1)
     drawn = torch.multinomial(probs.view(-1, probs.shape[-1]), 1).view(canvas.shape)
-    conf = probs.gather(-1, drawn.unsqueeze(-1)).squeeze(-1)
+    # Measure confidence on raw unsharpened T=1.0 probabilities so low temperature does not inflate weak guesses.
+    raw_probs = torch.softmax(logits_f, dim=-1)
+    conf = raw_probs.gather(-1, drawn.unsqueeze(-1)).squeeze(-1)
 
     if is_final_step:
         new_commit = ~committed

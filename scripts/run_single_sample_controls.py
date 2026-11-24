@@ -300,6 +300,7 @@ def save_checkpoint(
     save_optimizer: bool = True,
     max_shard_size: str = "2GB",
     hf_repo: str | None = None,
+    processor=None,
 ):
     from safetensors.torch import save_file
 
@@ -315,7 +316,9 @@ def save_checkpoint(
         model.save_pretrained(staging, max_shard_size=max_shard_size)
     except TypeError:
         model.save_pretrained(staging)
-    if hasattr(tokenizer, "save_pretrained"):
+    if processor is not None and hasattr(processor, "save_pretrained"):
+        processor.save_pretrained(staging)
+    elif hasattr(tokenizer, "save_pretrained"):
         tokenizer.save_pretrained(staging)
     save_file(
         {k: v.detach().cpu().contiguous() for k, v in _get_conditioner(model).state_dict().items()},

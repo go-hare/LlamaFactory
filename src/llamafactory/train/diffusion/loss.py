@@ -610,8 +610,9 @@ def _compute_ar_teacher_topk(
     pad_id: int,
     kl_topk: int,
     kl_temp: float,
+    multimodal_inputs: list[dict | None] | None = None,
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
-    """Run one causal AR teacher forward pass and extract top-K soft targets for each row's selected blocks."""
+    """Run one causal AR teacher forward pass (text or multimodal) and extract top-K soft targets."""
     device = clean_full_seqs[0].device
     batch = len(clean_full_seqs)
     max_len = max(seq.numel() for seq in clean_full_seqs)
@@ -625,7 +626,26 @@ def _compute_ar_teacher_topk(
     min_start = min(int(p_len) + int(s_blk) * canvas_size - 1 for p_len, s_blk in zip(prompt_lengths, start_blocks))
     keep_n = max_len - min_start
     use_keep = _supports_logits_to_keep(ar_teacher) and 0 < keep_n < max_len
-    extra = {"logits_to_keep": keep_n} if use_keep else {}
+    extra: dict = {"logits_to_keep": keep_n} if use_keep else {}
+
+    teacher_adapter = get_diffusion_adapter(ar_teacher)
+    if multimodal_inputs is not None and any(mm is not None for mm in multimodal_inputs):
+        base_pos = (attn_mask.cumsum(dim=-1) - 1).clamp(min=0)
+        position_ids = teacher_adapter.build_position_ids(
+            ar_teacher,
+            [seq[:p_len] for seq, p_len in zip(clean_full_seqs, prompt_lengths)],
+            multimodal_inputs,
+            base_pos,
+            clean_lengths=[int(seq.numel()) for seq in clean_full_seqs],
+            canvas_start=max_len,
+            noisy_start_offsets=[0] * batch,
+            noisy_lengths=[0] * batch,
+            pad_id=pad_id,
+        )
+        mm_batch = teacher_adapter.prepare_multimodal_batch(ar_teacher, multimodal_inputs, device)
+        extra["position_ids"] = position_ids
+        extra.update(mm_batch.kwargs_for_rows(None, allow_grad=False))
+
     out = ar_teacher(input_ids=input_ids, attention_mask=attn_mask, use_cache=False, **extra)
     logits = out.logits
     offset = (max_len - keep_n) if use_keep else 0
@@ -646,6 +666,7 @@ def _compute_ar_teacher_topk(
         top_vals, top_idx = torch.topk(row_logits, k=k, dim=-1)
         top_p = torch.softmax(top_vals / temp, dim=-1)
         results.append((top_p, top_idx))
+    del out, logits
     return results
 
 
@@ -794,6 +815,7 @@ def diffusion_all_blocks_step(
             pad_id=pad_id,
             kl_topk=kl_topk,
             kl_temp=kl_temp,
+            multimodal_inputs=multimodal_inputs,
         )
         if use_kl
         else None
