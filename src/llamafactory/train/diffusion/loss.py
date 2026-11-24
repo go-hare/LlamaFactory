@@ -970,16 +970,18 @@ def diffusion_all_blocks_step(
             total_blocks += 1
 
             if ar_row is not None and b_body_len > 0:
-                body_mask = (torch.arange(canvas_size, device=device) < b_body_len) & b_valid
-                if bool(body_mask.any()):
+                # Apply causal AR-teacher KL strictly on corrupted body tokens weighted by noise level t:
+                # clean (~b_corr) tokens stay sharp preservation; high-noise tokens get full AR-teacher alignment.
+                kl_mask = (torch.arange(canvas_size, device=device) < b_body_len) & b_valid & b_corr
+                if bool(kl_mask.any()):
                     top_p, top_idx = ar_row
                     kl_tok = _topk_forward_kl(
-                        b_logits[body_mask],
-                        top_p[sl][body_mask],
-                        top_idx[sl][body_mask],
+                        b_logits[kl_mask],
+                        top_p[sl][kl_mask],
+                        top_idx[sl][kl_mask],
                         kl_temp=kl_temp,
                     )
-                    block_kl_losses.append(kl_tok.mean())
+                    block_kl_losses.append(float(b_time) * kl_tok.mean())
 
             if diagnostics:
                 ce_vec = F.cross_entropy(b_logits.detach().float(), b_targets, reduction="none")
