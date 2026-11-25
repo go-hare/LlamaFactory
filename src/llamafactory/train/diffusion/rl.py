@@ -247,6 +247,120 @@ def _dynamic_parallel_step(
     return next_canvas, next_committed, scaled, entropy
 
 
+def _has_bpe_boundary_overlap(left_piece: str, right_piece: str) -> bool:
+    """Detect BPE subword stutter across adjacent tokens (e.g. `散`+`散射`, `三点`+`点`, `autgressive`+`gressive`).
+
+    Preserves legitimate single-character CJK reduplications (`谢`+`谢`, `慢`+`慢`) because their combined length is 2.
+    """
+    if not left_piece or not right_piece:
+        return False
+    last_ch = left_piece[-1]
+    if not last_ch.isascii() and right_piece[0] == last_ch and (len(left_piece) + len(right_piece) >= 3):
+        return True
+    l_strip = left_piece.rstrip()
+    r_strip = right_piece.lstrip()
+    if len(l_strip) >= 3 and len(r_strip) >= 3 and l_strip[-1].isascii() and r_strip[0].isascii():
+        ll, rl = l_strip.lower(), r_strip.lower()
+        if ll.endswith(rl) or rl.startswith(ll) or any(ll.endswith(rl[:k]) for k in range(3, min(len(ll), len(rl)) + 1)):
+            return True
+    return False
+
+
+def _contiguous_parallel_step(
+    logits: torch.Tensor,
+    canvas: torch.Tensor,
+    committed: torch.Tensor,
+    *,
+    temperature: float,
+    confidence_threshold: float,
+    vocab_size: int,
+    is_final_step: bool = False,
+    defer_adjacent_duplicates: bool = False,
+    exempt_tokens: tuple[int, ...] = (),
+    tokenizer=None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Zero-gap left-to-right contiguous parallel commit with BPE boundary overlap guard."""
+    logits_f = logits.float()
+    scaled = logits_f / max(temperature, 1e-6)
+    log_probs = torch.log_softmax(scaled, dim=-1)
+    probs = torch.exp(log_probs)
+    safe_log_probs = torch.where(probs == 0, torch.zeros_like(log_probs), log_probs)
+    entropy = -(safe_log_probs * probs).sum(dim=-1)
+    drawn = torch.multinomial(probs.view(-1, probs.shape[-1]), 1).view(canvas.shape)
+    raw_probs = torch.softmax(logits_f, dim=-1)
+    conf = raw_probs.gather(-1, drawn.unsqueeze(-1)).squeeze(-1)
+
+    exempt_set = {int(t) for t in exempt_tokens}
+    piece_cache: dict[int, str] = {}
+
+    def _piece(tid: int) -> str:
+        if tokenizer is None:
+            return ""
+        val = piece_cache.get(tid)
+        if val is None:
+            val = tokenizer.decode([tid])
+            piece_cache[tid] = val
+        return val
+
+    new_commit = torch.zeros_like(committed)
+    tau = float(confidence_threshold)
+    seq_len = canvas.shape[1]
+
+    for b in range(canvas.shape[0]):
+        uncomm_pos = (~committed[b]).nonzero(as_tuple=False).flatten()
+        if uncomm_pos.numel() == 0:
+            continue
+        cursor = int(uncomm_pos[0].item())
+        if is_final_step:
+            new_commit[b, cursor:] = ~committed[b, cursor:]
+            continue
+
+        # Guard cursor itself against BPE overlap / multi-char duplicate with the already-committed left neighbor.
+        cur_tid = int(drawn[b, cursor].item())
+        if defer_adjacent_duplicates and cursor > 0 and cur_tid not in exempt_set:
+            left_tid = int(canvas[b, cursor - 1].item())
+            if left_tid not in exempt_set:
+                left_p = _piece(left_tid)
+                cur_p = _piece(cur_tid)
+                dup_hit = (cur_tid == left_tid and (tokenizer is None or len(left_p.strip()) >= 2)) or (
+                    tokenizer is not None and _has_bpe_boundary_overlap(left_p, cur_p)
+                )
+                if dup_hit:
+                    alt_probs = probs[b, cursor].clone()
+                    alt_probs[cur_tid] = 0.0
+                    if float(alt_probs.sum()) > 1e-8:
+                        cur_tid = int(alt_probs.argmax().item())
+                        drawn[b, cursor] = cur_tid
+
+        end = cursor + 1
+        prev_tid = cur_tid
+        prev_piece = _piece(prev_tid)
+        conf_row = conf[b].tolist()
+        drawn_row = drawn[b].tolist()
+
+        while end < seq_len and not bool(committed[b, end]) and conf_row[end] >= tau:
+            tid = int(drawn_row[end])
+            if tid in exempt_set:
+                end += 1
+                break
+            if defer_adjacent_duplicates:
+                if tid == prev_tid:
+                    break
+                cur_piece = _piece(tid)
+                if tokenizer is not None and _has_bpe_boundary_overlap(prev_piece, cur_piece):
+                    break
+                prev_piece = cur_piece
+            prev_tid = tid
+            end += 1
+
+        new_commit[b, cursor:end] = True
+
+    noise = torch.randint(0, vocab_size, canvas.shape, device=canvas.device)
+    next_canvas = torch.where(committed, canvas, torch.where(new_commit, drawn, noise))
+    next_committed = committed | new_commit
+    return next_canvas, next_committed, scaled, entropy
+
+
 def _ddim_step(
     logits: torch.Tensor,
     canvas: torch.Tensor,
@@ -423,9 +537,10 @@ def sample_canvas(
     progressive_commit: bool = False,
     confidence_threshold: float = 0.75,
     frontier_window: int = 32,
+    tokenizer=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Denoise one canvas from uniform noise or [MASK] prior with carried self-conditioning."""
-    if sampler not in ("entropy", "frontier", "dynamic", "ddim", "mask", "remdm", "rcd"):
+    if sampler not in ("entropy", "frontier", "dynamic", "contiguous", "ddim", "mask", "remdm", "rcd"):
         raise ValueError(f"Unknown diffusion sampler: {sampler}")
     if sampler in ("mask", "remdm", "rcd") and mask_id is None:
         raise ValueError(f"sampler={sampler!r} requires an explicit mask_id.")
@@ -474,7 +589,20 @@ def sample_canvas(
             logits = _apply_local_repetition_penalty(
                 logits, canvas, penalty=repetition_penalty, exempt_tokens=rep_exempt
             )
-        if sampler == "dynamic":
+        if sampler == "contiguous":
+            next_canvas, committed, shaped_logits, token_entropy = _contiguous_parallel_step(
+                logits,
+                canvas,
+                committed,
+                temperature=temperature,
+                confidence_threshold=confidence_threshold,
+                vocab_size=vocab_size,
+                is_final_step=is_final_step,
+                defer_adjacent_duplicates=defer_adjacent_duplicates,
+                exempt_tokens=rep_exempt,
+                tokenizer=tokenizer,
+            )
+        elif sampler == "dynamic":
             next_canvas, committed, shaped_logits, token_entropy = _dynamic_parallel_step(
                 logits,
                 canvas,
@@ -553,7 +681,7 @@ def sample_canvas(
                 protect_stop_time=protect_stop_time,
             )
         mean_entropy = token_entropy.mean()
-        if sampler in ("frontier", "dynamic"):
+        if sampler in ("frontier", "dynamic", "contiguous"):
             sc_embeddings = _aligned_sc(
                 token_embedding, next_canvas, committed, shaped_logits, scale=embed_scale
             )
@@ -585,7 +713,7 @@ def sample_canvas(
             sc_embeddings = _embed_distribution(token_embedding, shaped_logits, scale=embed_scale)
         stable = bool((shaped_logits.argmax(dim=-1) == canvas).all())
         confident = bool(mean_entropy <= entropy_threshold)
-        if sampler not in ("frontier", "dynamic") and early_stop and stable and confident and not (sampler in ("mask", "remdm", "rcd") and bool((next_canvas == int(mask_id)).any())):
+        if sampler not in ("frontier", "dynamic", "contiguous") and early_stop and stable and confident and not (sampler in ("mask", "remdm", "rcd") and bool((next_canvas == int(mask_id)).any())):
             canvas = next_canvas
             break
         canvas = next_canvas
@@ -615,6 +743,7 @@ def sample_response(
     progressive_commit: bool = False,
     confidence_threshold: float = 0.75,
     frontier_window: int = 32,
+    tokenizer=None,
 ) -> torch.Tensor:
     """Block-autoregressive generation across canvases, truncating at the first stop token."""
     running_prompt = prompt.view(-1)
@@ -647,6 +776,7 @@ def sample_response(
             progressive_commit=progressive_commit,
             confidence_threshold=confidence_threshold,
             frontier_window=frontier_window,
+            tokenizer=tokenizer,
         )
         row = canvas[0]
         hit_idx = None

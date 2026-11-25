@@ -17,11 +17,82 @@ from llamafactory.train.diffusion.adapter import get_diffusion_adapter
 from llamafactory.train.diffusion.loss import _get_conditioner
 from llamafactory.train.diffusion.rl import (
     _commit,
+    _contiguous_parallel_step,
     _dynamic_parallel_step,
     _frontier_commit_step,
+    _has_bpe_boundary_overlap,
     few_step_distill_step,
     sample_canvas,
 )
+
+
+def test_contiguous_parallel_zero_gap_and_bpe_overlap_guard():
+    # BPE stutter patterns caught while valid single-char CJK reduplications are preserved.
+    assert _has_bpe_boundary_overlap("散", "散射")
+    assert _has_bpe_boundary_overlap("三点", "点")
+    assert _has_bpe_boundary_overlap("如厕", "厕")
+    assert _has_bpe_boundary_overlap("autgressive", "gressive")
+    assert not _has_bpe_boundary_overlap("谢", "谢")
+    assert not _has_bpe_boundary_overlap("慢", "慢")
+    assert not _has_bpe_boundary_overlap("天空", "是蓝色的")
+
+    class FakeTok:
+        mapping = {10: "三点", 11: "点", 12: "解释", 13: "蓝光", 14: "散", 15: "散射"}
+
+        def decode(self, ids):
+            return "".join(self.mapping.get(i, "x") for i in ids)
+
+    vocab_size = 32
+    canvas = torch.full((1, 8), 5, dtype=torch.long)
+    canvas[0, 0] = 10  # committed "三点"
+    committed = torch.zeros(1, 8, dtype=torch.bool)
+    committed[0, 0] = True
+
+    # Pos 1 wants "点" (overlaps committed "三点"!) with second choice "解释" (id 12); pos 2 wants "蓝光" (high conf); pos 3 low conf; pos 5 high conf.
+    logits = torch.full((1, 8, vocab_size), -10.0)
+    logits[0, 1, 11] = 5.0
+    logits[0, 1, 12] = 4.0
+    logits[0, 2, 13] = 8.0
+    logits[0, 3, :] = 0.0  # branch point -> must stop contiguous span here (never jump to pos 5!)
+    logits[0, 5, 14] = 8.0
+
+    next_c, next_comm, _, _ = _contiguous_parallel_step(
+        logits,
+        canvas,
+        committed,
+        temperature=0.5,
+        confidence_threshold=0.50,
+        vocab_size=vocab_size,
+        defer_adjacent_duplicates=True,
+        tokenizer=FakeTok(),
+    )
+    # Pos 1 switched from overlapping "点" (11) -> "解释" (12); pos 2 unlocked contiguously; pos 3..7 stayed uncommitted (no gap jump to pos 5!).
+    assert int(next_c[0, 1]) == 12
+    assert int(next_c[0, 2]) == 13
+    assert bool(next_comm[0, :3].all())
+    assert not bool(next_comm[0, 3:].any())
+
+    # End-to-end sample_canvas(sampler="contiguous") with KV cache + multimodal Qwen3-VL works cleanly.
+    model = tiny_qwen3_vl("eager")
+    prompt, mm = make_mm_prompt(3)
+    with torch.no_grad():
+        c, ent = sample_canvas(
+            model,
+            prompt,
+            steps=8,
+            canvas_size=8,
+            pad_id=0,
+            sampler="contiguous",
+            temperature=0.5,
+            multimodal_input=mm,
+            use_kv_cache=True,
+            defer_adjacent_duplicates=True,
+            confidence_threshold=0.50,
+            exempt_tokens=(1,),
+            tokenizer=FakeTok(),
+        )
+    assert c.shape == (1, 8)
+    assert torch.isfinite(ent)
 
 
 def test_dynamic_parallel_step_branch_fallback_and_confident_parallel_unlock():

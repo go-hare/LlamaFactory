@@ -22,15 +22,15 @@ from llamafactory.train.diffusion.rl import sample_response
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ckpt", type=str, required=True, help="Local checkpoint directory or HF repo path")
-    parser.add_argument("--processor-model", type=str, default="Qwen/Qwen3-VL-4B-Thinking", help="Base HF model for tokenizer/processor")
+    parser.add_argument("--processor-model", type=str, default=None, help="Optional base HF model if checkpoint lacks preprocessor_config.json")
     parser.add_argument("--prompt", type=str, default="Explain in 3 concise bullet points how block-diffusion language models work.")
     parser.add_argument("--image", type=str, default=None, help="Optional image path for multimodal VLM inference")
     parser.add_argument("--max-image-side", type=int, default=768)
-    parser.add_argument("--sampler", choices=["dynamic", "frontier", "entropy"], default="dynamic")
-    parser.add_argument("--canvas-size", type=int, default=128)
-    parser.add_argument("--max-blocks", type=int, default=6)
-    parser.add_argument("--steps", type=int, default=128, help="Max denoising steps per block (dynamic early-exits automatically)")
-    parser.add_argument("--tau", type=float, default=0.75, help="Confidence threshold for dynamic parallel decoding")
+    parser.add_argument("--sampler", choices=["contiguous", "dynamic", "frontier", "entropy"], default="contiguous")
+    parser.add_argument("--canvas-size", type=int, default=64)
+    parser.add_argument("--max-blocks", type=int, default=10)
+    parser.add_argument("--steps", type=int, default=64, help="Max denoising steps per block (contiguous/dynamic early-exit automatically)")
+    parser.add_argument("--tau", type=float, default=0.50, help="Raw T=1.0 confidence threshold for parallel decoding")
     parser.add_argument("--window", type=int, default=32, help="Lookahead window for dynamic parallel decoding")
     parser.add_argument("--temperature", type=float, default=0.5)
     parser.add_argument("--repetition-penalty", type=float, default=1.15)
@@ -76,9 +76,27 @@ def main():
         args.prompt, args.image, tok, proc, max_image_side=args.max_image_side, device=device
     )
 
-    torch.manual_seed(args.seed)
+    # Short warmup to remove first-step CUDA/SDPA kernel JIT overhead from timings.
+    with torch.inference_mode():
+        sample_response(
+            model,
+            prompt_ids,
+            max_canvases=1,
+            steps=4,
+            canvas_size=min(32, args.canvas_size),
+            pad_id=pad_id,
+            stop_tokens=stop_tokens,
+            sampler=args.sampler,
+            temperature=args.temperature,
+            multimodal_input=mm_in,
+            use_kv_cache=True,
+            confidence_threshold=args.tau,
+            tokenizer=tok,
+        )
     if device == "cuda":
         torch.cuda.synchronize()
+
+    torch.manual_seed(args.seed)
     t0 = time.perf_counter()
     with torch.inference_mode():
         out_ids = sample_response(
@@ -97,6 +115,7 @@ def main():
             defer_adjacent_duplicates=True,
             confidence_threshold=args.tau,
             frontier_window=args.window,
+            tokenizer=tok,
         )
     if device == "cuda":
         torch.cuda.synchronize()
