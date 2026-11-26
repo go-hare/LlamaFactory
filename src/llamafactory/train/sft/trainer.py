@@ -128,15 +128,31 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
             def _duplex_weighted_ce(outputs, labels, num_items_in_batch=None):
                 logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
-                shift_logits = logits[..., :-1, :].contiguous().float()
-                shift_labels = labels[..., 1:].contiguous()
-                vocab_size = shift_logits.size(-1)
-                w = torch.ones(vocab_size, dtype=torch.float32, device=shift_logits.device)
+                vocab_size = logits.size(-1)
+                w = torch.ones(vocab_size, dtype=torch.float32, device=logits.device)
                 for tid, val in weight_map.items():
                     if 0 <= tid < vocab_size:
                         w[tid] = float(val)
-                loss_fct = torch.nn.CrossEntropyLoss(weight=w, ignore_index=IGNORE_INDEX)
-                return loss_fct(shift_logits.view(-1, vocab_size), shift_labels.view(-1))
+
+                # Zero-copy per-row valid-token-only FP32 weighted CE (~50 MB peak instead of ~2 GiB)
+                loss_sum_fn = torch.nn.CrossEntropyLoss(weight=w, reduction="sum")
+                total_loss = torch.zeros((), dtype=torch.float32, device=logits.device)
+                total_weight = torch.zeros((), dtype=torch.float32, device=logits.device)
+                seq_minus_1 = logits.size(1) - 1
+                chunk_sz = 256
+                for b in range(logits.size(0)):
+                    for start in range(0, seq_minus_1, chunk_sz):
+                        end = min(start + chunk_sz, seq_minus_1)
+                        lbl_c = labels[b, start + 1 : end + 1]
+                        valid_mask = lbl_c != IGNORE_INDEX
+                        if valid_mask.any():
+                            tgt_c = lbl_c[valid_mask]
+                            log_c = logits[b, start:end, :][valid_mask].float()
+                            total_loss = total_loss + loss_sum_fn(log_c, tgt_c)
+                            total_weight = total_weight + w[tgt_c].sum()
+                if total_weight.item() == 0:
+                    return logits[:, 0, 0].sum() * 0.0
+                return total_loss / total_weight
 
             self.compute_loss_func = _duplex_weighted_ce
 

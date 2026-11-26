@@ -25,7 +25,7 @@ duplex_token_weights: "8:8.0,9:4.0,11:4.0,12:6.0,13:6.0"
 ### dataset
 dataset: gemma4_duplex_route1
 eval_dataset: gemma4_duplex_route1_valid
-template: gemma4n
+template: gemma4n_duplex
 cutoff_len: 4096
 overwrite_cache: true
 preprocessing_num_workers: 4
@@ -50,3 +50,9 @@ warmup_steps: 50
 bf16: true
 gradient_checkpointing: true
 ddp_timeout: 180000000
+
+### eval
+per_device_eval_batch_size: 1
+eval_strategy: steps
+eval_steps: 200
+prediction_loss_only: true

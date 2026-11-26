@@ -354,8 +354,10 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
 
         fake_input_ids = []
         has_dummy_image = False
+        need_dist_dummy = torch.distributed.is_available() and torch.distributed.is_initialized()
         if (
-            self.template.mm_plugin.image_token is not None
+            need_dist_dummy
+            and self.template.mm_plugin.image_token is not None
             and sum(batch_imglens) == 0
             and sum(batch_vidlens) == 0
             and not is_moss_vl  # MOSS-VL builds one native zero-valued dummy per text-only sample in its plugin.
@@ -375,7 +377,7 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             has_dummy_image = True
 
         if (
-            self.template.mm_plugin.audio_token is not None and sum(batch_audlens) == 0
+            need_dist_dummy and self.template.mm_plugin.audio_token is not None and sum(batch_audlens) == 0
         ):  # avoid process hanging in zero3/fsdp case
             fake_messages = [{"role": "user", "content": AUDIO_PLACEHOLDER}]
             fake_audios = [np.zeros(1600)]

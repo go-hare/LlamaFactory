@@ -108,6 +108,32 @@ def load_tokenizer(model_args: "ModelArguments") -> "TokenizerModule":
     except Exception as e:
         logger.info_rank0(f"Failed to load processor: {e}.")
         processor = None
+        if "gemma-4" in str(model_args.model_name_or_path).lower() or "gemma4" in str(model_args.model_name_or_path).lower():
+            try:
+                from transformers.models.gemma4.feature_extraction_gemma4 import Gemma4AudioFeatureExtractor
+
+                class Gemma4AudioOnlyProcessor:
+                    def __init__(self, tok, fe):
+                        self.tokenizer = tok
+                        self.feature_extractor = fe
+                        self.image_processor = object()
+                        self.video_processor = object()
+                        for attr in (
+                            "boi_token", "eoi_token", "boa_token", "eoa_token",
+                            "image_token", "audio_token", "image_token_id", "audio_token_id",
+                        ):
+                            setattr(self, attr, getattr(tok, attr, None))
+                        self.video_token = "<|video|>"
+                        self.video_token_id = tok.convert_tokens_to_ids("<|video|>")
+
+                    def save_pretrained(self, save_directory, **kwargs):
+                        self.feature_extractor.save_pretrained(save_directory, **kwargs)
+
+                fe = Gemma4AudioFeatureExtractor.from_pretrained(model_args.model_name_or_path, **init_kwargs)
+                processor = Gemma4AudioOnlyProcessor(tokenizer, fe)
+                logger.info_rank0("Initialized lightweight Gemma4AudioOnlyProcessor fallback.")
+            except Exception as fallback_exc:
+                logger.warning_rank0(f"Audio-only processor fallback also failed: {fallback_exc}")
 
     # Avoid load tokenizer, see:
     # https://github.com/huggingface/transformers/blob/v4.40.0/src/transformers/models/auto/processing_auto.py#L324

@@ -243,7 +243,11 @@ def _setup_lora_tuning(
         ):
             raise ValueError("DoRA is not compatible with PTQ-quantized models.")
 
-        if model_args.resize_vocab and finetuning_args.additional_target is None:
+        if (
+            model_args.resize_vocab
+            and finetuning_args.additional_target is None
+            and not finetuning_args.trainable_token_indices
+        ):
             input_embeddings = model.get_input_embeddings()
             output_embeddings = model.get_output_embeddings()
             module_names = set()
@@ -352,7 +356,17 @@ def _setup_lora_tuning(
                 try:
                     from transformers import AutoTokenizer
 
-                    tok = AutoTokenizer.from_pretrained(model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code)
+                    try:
+                        tok = AutoTokenizer.from_pretrained(
+                            model_args.model_name_or_path,
+                            trust_remote_code=model_args.trust_remote_code,
+                            local_files_only=True,
+                        )
+                    except Exception:
+                        tok = AutoTokenizer.from_pretrained(
+                            model_args.model_name_or_path,
+                            trust_remote_code=model_args.trust_remote_code,
+                        )
                     emb_mod = model.get_input_embeddings()
                     if hasattr(emb_mod, "token_adapter"):
                         with torch.no_grad():

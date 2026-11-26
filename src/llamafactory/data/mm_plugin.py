@@ -314,14 +314,26 @@ class MMPluginMixin:
         results, sampling_rates = [], []
         for audio in audios:
             if not isinstance(audio, np.ndarray):
-                audio, sr = torchaudio.load(audio)
-                if audio.shape[0] > 1:
-                    audio = audio.mean(dim=0, keepdim=True)
+                try:
+                    audio, sr = torchaudio.load(audio)
+                    if audio.shape[0] > 1:
+                        audio = audio.mean(dim=0, keepdim=True)
+                    if sr != sampling_rate:
+                        audio = torchaudio.functional.resample(audio, sr, int(sampling_rate))
+                    audio = audio.squeeze(0).numpy()
+                except Exception:
+                    import soundfile as sf
 
-                if sr != sampling_rate:
-                    audio = torchaudio.functional.resample(audio, sr, sampling_rate)
-
-                audio = audio.squeeze(0).numpy()
+                    wav, sr = sf.read(audio, dtype="float32")
+                    if wav.ndim > 1:
+                        wav = wav.mean(axis=1)
+                    if sr != sampling_rate:
+                        wav = (
+                            torchaudio.functional.resample(torch.from_numpy(wav).unsqueeze(0), sr, int(sampling_rate))
+                            .squeeze(0)
+                            .numpy()
+                        )
+                    audio = wav
 
             results.append(audio)
             sampling_rates.append(sampling_rate)
