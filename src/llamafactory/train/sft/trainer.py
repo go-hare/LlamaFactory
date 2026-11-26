@@ -126,7 +126,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         elif finetuning_args.duplex_token_weights:
             weight_map: dict[int, float] = finetuning_args.duplex_token_weights
 
-            def _duplex_weighted_ce(outputs, labels, num_items_in_batch=None):
+            def _duplex_weighted_ce(outputs, labels, num_items_in_batch=None, aligned: bool = False):
                 logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
                 vocab_size = logits.size(-1)
                 w = torch.ones(vocab_size, dtype=torch.float32, device=logits.device)
@@ -138,12 +138,12 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 loss_sum_fn = torch.nn.CrossEntropyLoss(weight=w, reduction="sum")
                 total_loss = torch.zeros((), dtype=torch.float32, device=logits.device)
                 total_weight = torch.zeros((), dtype=torch.float32, device=logits.device)
-                seq_minus_1 = logits.size(1) - 1
-                chunk_sz = 256
+                seq_len = logits.size(1) if aligned else logits.size(1) - 1
+                chunk_sz = 128
                 for b in range(logits.size(0)):
-                    for start in range(0, seq_minus_1, chunk_sz):
-                        end = min(start + chunk_sz, seq_minus_1)
-                        lbl_c = labels[b, start + 1 : end + 1]
+                    for start in range(0, seq_len, chunk_sz):
+                        end = min(start + chunk_sz, seq_len)
+                        lbl_c = labels[b, start:end] if aligned else labels[b, start + 1 : end + 1]
                         valid_mask = lbl_c != IGNORE_INDEX
                         if valid_mask.any():
                             tgt_c = lbl_c[valid_mask]
@@ -180,7 +180,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         return super()._get_train_sampler(*args, **kwargs)
 
     @override
-    def compute_loss(self, model, inputs, *args, **kwargs):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if self.finetuning_args.use_asft_loss:
             with torch.no_grad():
                 ref_outputs = self.ref_model(
@@ -189,9 +189,30 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 )
                 ref_logits = ref_outputs.logits
             outputs = model(**inputs)
-            return self.compute_loss_func(outputs, inputs["labels"], ref_logits)
+            loss = self.compute_loss_func(outputs, inputs["labels"], ref_logits)
+            return (loss, outputs) if return_outputs else loss
+        elif self.finetuning_args.duplex_token_weights and "labels" in inputs:
+            # Slice hidden_states BEFORE lm_head & final_logit_softcapping to valid assistant positions only
+            # (~6 GiB VRAM saved on Gemma-4's 262k vocab).
+            labels = inputs.pop("labels")
+            shifted_labels = labels[:, 1:]
+            active_cols = torch.nonzero((shifted_labels != IGNORE_INDEX).any(dim=0), as_tuple=False).squeeze(-1)
+            if active_cols.numel() == 0:
+                model_inputs = {**inputs, "logits_to_keep": 1}
+                outputs = model(**model_inputs)
+                loss = outputs["logits"][:, 0, 0].sum() * 0.0
+                return (loss, outputs) if return_outputs else loss
+            model_inputs = {**inputs, "logits_to_keep": active_cols}
+            outputs = model(**model_inputs)
+            sub_labels = shifted_labels[:, active_cols]
+            loss = self.compute_loss_func(
+                outputs, sub_labels, num_items_in_batch=num_items_in_batch, aligned=True
+            )
+            return (loss, outputs) if return_outputs else loss
         else:
-            return super().compute_loss(model, inputs, *args, **kwargs)
+            return super().compute_loss(
+                model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch
+            )
 
     @override
     def prediction_step(

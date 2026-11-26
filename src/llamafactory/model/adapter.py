@@ -280,23 +280,36 @@ def _setup_lora_tuning(
                         def _patched_forward_adapters(self, x: torch.Tensor, active_adapters, *args, **kwargs) -> torch.Tensor:
                             if self.disable_adapters or not active_adapters or self.merged:
                                 return _orig_fa(self, x, active_adapters, *args, **kwargs)
-                            if isinstance(self.base_layer, (torch.nn.Embedding, torch.nn.Linear)):
-                                return _orig_fa(self, x, active_adapters, *args, **kwargs)
                             self._check_overlapping_tokens(active_adapters)
-                            W = self.get_merged_weights(active_adapters)
+                            # Zero-copy sparse delta path: avoids allocating a full [V, D] copy and
+                            # full [V, D] backward gradient (~3 GiB saved on Gemma-4's 262k vocab).
+                            base_W = self.base_layer.weight.detach()
                             if not torch.is_floating_point(x):
                                 res = _F.embedding(
                                     input=x,
-                                    weight=W,
+                                    weight=base_W,
                                     padding_idx=getattr(self.base_layer, "padding_idx", None),
                                 )
+                                for adapter_name in active_adapters:
+                                    idx = torch.tensor(self.token_indices[adapter_name], dtype=torch.long, device=x.device)
+                                    deltas = self.trainable_tokens_delta[adapter_name].to(device=res.device, dtype=res.dtype)
+                                    delta_diff = deltas - base_W.index_select(0, idx).to(res.dtype)
+                                    match = (x.unsqueeze(-1) == idx).to(res.dtype)
+                                    res = res + torch.matmul(match, delta_diff)
                                 scale = self._get_embed_scale() if hasattr(self, "_get_embed_scale") else None
                                 if scale is None:
                                     scale = getattr(self.base_layer, "embed_scale", getattr(self.base_layer, "scalar_embed_scale", None))
                                 if scale is not None:
                                     res = res * (scale.to(res.dtype) if isinstance(scale, torch.Tensor) else float(scale))
                                 return res
-                            return _F.linear(input=x, weight=W, bias=getattr(self.base_layer, "bias", None))
+                            res = _F.linear(input=x, weight=base_W, bias=getattr(self.base_layer, "bias", None))
+                            for adapter_name in active_adapters:
+                                idx = torch.tensor(self.token_indices[adapter_name], dtype=torch.long, device=x.device)
+                                deltas = self.trainable_tokens_delta[adapter_name].to(device=x.device, dtype=x.dtype)
+                                delta_diff = deltas - base_W.index_select(0, idx).to(x.dtype)
+                                delta_logits = _F.linear(x, delta_diff)
+                                res = res.index_add(-1, idx, delta_logits)
+                            return res
 
                         TrainableTokensLayer.forward_adapters = _patched_forward_adapters
                         TrainableTokensLayer._gemma4_patched = True
