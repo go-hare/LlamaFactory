@@ -87,6 +87,25 @@ def main() -> None:
     fe = Gemma4AudioFeatureExtractor.from_pretrained(args.base_model)
 
     print(f"[评测] 加载底座 {args.base_model} + 适配器 {adapter_dir} (设备: {device}, 精度: {dtype})")
+    import torch.nn.functional as _F
+    from peft.tuners.trainable_tokens.layer import TrainableTokensLayer
+    if not getattr(TrainableTokensLayer, "_gemma4_patched", False):
+        _orig_fa = TrainableTokensLayer.forward_adapters
+        def _patched_fa(self, x, active_adapters, *a, **kw):
+            if self.disable_adapters or not active_adapters or self.merged or isinstance(self.base_layer, (torch.nn.Embedding, torch.nn.Linear)):
+                return _orig_fa(self, x, active_adapters, *a, **kw)
+            self._check_overlapping_tokens(active_adapters)
+            W = self.get_merged_weights(active_adapters)
+            if not torch.is_floating_point(x):
+                res = _F.embedding(x, W, padding_idx=getattr(self.base_layer, "padding_idx", None))
+                scale = getattr(self.base_layer, "embed_scale", getattr(self.base_layer, "scalar_embed_scale", None))
+                if scale is not None:
+                    res = res * (scale.to(res.dtype) if isinstance(scale, torch.Tensor) else float(scale))
+                return res
+            return _F.linear(x, W, bias=getattr(self.base_layer, "bias", None))
+        TrainableTokensLayer.forward_adapters = _patched_fa
+        TrainableTokensLayer._gemma4_patched = True
+
     base_model = Gemma4ForConditionalGeneration.from_pretrained(args.base_model, dtype=dtype)
     model = PeftModel.from_pretrained(base_model, str(adapter_dir)).to(device)
     model.eval()

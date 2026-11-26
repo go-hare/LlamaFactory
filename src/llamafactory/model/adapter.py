@@ -266,6 +266,38 @@ def _setup_lora_tuning(
             }
             if finetuning_args.trainable_token_indices:
                 peft_kwargs["trainable_token_indices"] = finetuning_args.trainable_token_indices
+                try:
+                    import torch.nn.functional as _F
+                    from peft.tuners.trainable_tokens.layer import TrainableTokensLayer
+
+                    if not getattr(TrainableTokensLayer, "_gemma4_patched", False):
+                        _orig_fa = TrainableTokensLayer.forward_adapters
+
+                        def _patched_forward_adapters(self, x: torch.Tensor, active_adapters, *args, **kwargs) -> torch.Tensor:
+                            if self.disable_adapters or not active_adapters or self.merged:
+                                return _orig_fa(self, x, active_adapters, *args, **kwargs)
+                            if isinstance(self.base_layer, (torch.nn.Embedding, torch.nn.Linear)):
+                                return _orig_fa(self, x, active_adapters, *args, **kwargs)
+                            self._check_overlapping_tokens(active_adapters)
+                            W = self.get_merged_weights(active_adapters)
+                            if not torch.is_floating_point(x):
+                                res = _F.embedding(
+                                    input=x,
+                                    weight=W,
+                                    padding_idx=getattr(self.base_layer, "padding_idx", None),
+                                )
+                                scale = self._get_embed_scale() if hasattr(self, "_get_embed_scale") else None
+                                if scale is None:
+                                    scale = getattr(self.base_layer, "embed_scale", getattr(self.base_layer, "scalar_embed_scale", None))
+                                if scale is not None:
+                                    res = res * (scale.to(res.dtype) if isinstance(scale, torch.Tensor) else float(scale))
+                                return res
+                            return _F.linear(input=x, weight=W, bias=getattr(self.base_layer, "bias", None))
+
+                        TrainableTokensLayer.forward_adapters = _patched_forward_adapters
+                        TrainableTokensLayer._gemma4_patched = True
+                except Exception as _patch_exc:
+                    logger.warning_rank0(f"Could not patch TrainableTokensLayer: {_patch_exc}")
             if finetuning_args.freeze_vision_tower and getattr(model.config, "model_type", None) in ("gemma4", "gemma3n"):
                 peft_kwargs["exclude_modules"] = r".*(vision_tower|audio_tower).*"
         elif finetuning_args.finetuning_type == "oft":
@@ -333,7 +365,8 @@ def _setup_lora_tuning(
                                 ref_ids = tok.encode(str(desc_text), add_special_tokens=False)
                                 if tid in idx_to_pos and ref_ids:
                                     target_v = base_w[ref_ids].mean(dim=0)
-                                    delta_p[idx_to_pos[tid]].copy_((target_v - base_w[tid]).to(delta_p.dtype))
+                                    # PEFT TrainableTokensLayer uses index_copy (replacement, not additive delta)
+                                    delta_p[idx_to_pos[tid]].copy_(target_v.to(delta_p.dtype))
                         logger.info_rank0("Initialized PEFT trainable_tokens_delta from semantic descriptions.")
                 except Exception as exc:
                     logger.warning_rank0(f"Skipped semantic trainable_tokens_delta init: {exc}")
