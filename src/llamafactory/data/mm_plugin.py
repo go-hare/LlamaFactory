@@ -1101,12 +1101,23 @@ class Gemma4Plugin(BasePlugin):
             )
             num_video_soft_tokens: list[int] = list(mm_inputs.get("num_soft_tokens_per_video", [1] * len(videos)))
             video_metadata = mm_inputs.get("video_metadata", [])
+            num_audio_soft_tokens: list[int] = []
+            if "input_features_mask" in mm_inputs:
+                for mask_row in mm_inputs["input_features_mask"]:
+                    m = mask_row
+                    t = len(m)
+                    for _ in range(2):
+                        t_out = (t + 2 - 3) // 2 + 1
+                        m = m[::2][:t_out]
+                        t = len(m)
+                    num_audio_soft_tokens.append(int(m.sum()))
         else:
             num_image_soft_tokens = [1] * len(images)
             num_video_soft_tokens = [1] * len(videos)
             video_metadata = [None] * len(videos)
+            num_audio_soft_tokens = [1] * len(audios)
 
-        audio_iter = iter(audios)
+        audio_iter = iter(num_audio_soft_tokens)
         image_iter = iter(num_image_soft_tokens)
         video_iter = iter(zip(num_video_soft_tokens, video_metadata))
 
@@ -1131,11 +1142,8 @@ class Gemma4Plugin(BasePlugin):
                 content = content.replace(VIDEO_PLACEHOLDER, video_str, 1)
 
             while AUDIO_PLACEHOLDER in content:
-                current_audio = next(audio_iter)
+                num_audio_tokens = next(audio_iter)
                 if self.expand_mm_tokens:
-                    num_audio_tokens = processor._compute_audio_num_tokens(
-                        current_audio, processor.feature_extractor.sampling_rate
-                    )
                     audio_str = f"{boa_token}{audio_token * num_audio_tokens}{eoa_token}"
                 else:
                     audio_str = f"{boa_token}{audio_token}{eoa_token}"
