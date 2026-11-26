@@ -387,7 +387,7 @@ def _create_loraplus_optimizer(
     }
     for name, param in model.named_parameters():
         if param.requires_grad:
-            if "lora_embedding_B" in name:
+            if "lora_embedding_B" in name or "trainable_tokens" in name:
                 param_dict["embedding"].append(param)
             elif "lora_B" in name or param.ndim == 1:
                 if name in decay_param_names:
@@ -546,6 +546,25 @@ def create_custom_optimizer(
 
     if finetuning_args.use_muon:
         return _create_muon_optimizer(model, training_args)
+
+    if finetuning_args.trainable_tokens_lr is not None:
+        token_params, other_params = [], []
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                if "trainable_tokens" in name:
+                    token_params.append(param)
+                else:
+                    other_params.append(param)
+        if token_params:
+            optim_class, optim_kwargs = Trainer.get_optimizer_cls_and_kwargs(training_args)
+            param_groups = [
+                dict(params=other_params, lr=training_args.learning_rate, weight_decay=training_args.weight_decay),
+                dict(params=token_params, lr=finetuning_args.trainable_tokens_lr, weight_decay=0.0),
+            ]
+            logger.info_rank0(
+                f"Using dedicated trainable_tokens_lr={finetuning_args.trainable_tokens_lr} for {len(token_params)} token adapter group(s)."
+            )
+            return optim_class(param_groups, **optim_kwargs)
 
 
 def create_custom_scheduler(

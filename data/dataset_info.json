@@ -745,5 +745,23 @@
       "prompt": "content"
     },
     "folder": "python"
+  },
+  "gemma4_duplex_route1": {
+    "file_name": "gemma4_duplex_route1/train.json",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "conversations",
+      "tools": "tools",
+      "audios": "audios"
+    }
+  },
+  "gemma4_duplex_route1_valid": {
+    "file_name": "gemma4_duplex_route1/valid.json",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "conversations",
+      "tools": "tools",
+      "audios": "audios"
+    }
   }
 }

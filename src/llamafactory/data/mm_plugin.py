@@ -1066,7 +1066,7 @@ class Gemma4Plugin(BasePlugin):
             mm_inputs.update(
                 feature_extractor(
                     audios,
-                    padding="max_length",
+                    padding="longest",
                     return_tensors="pt",
                 )
             )
@@ -1171,7 +1171,15 @@ class Gemma4Plugin(BasePlugin):
         ):
             mm_inputs.pop(key, None)
 
-        mm_inputs["mm_token_type_ids"] = processor.create_mm_token_type_ids(batch_ids)
+        if hasattr(processor, "create_mm_token_type_ids"):
+            mm_inputs["mm_token_type_ids"] = processor.create_mm_token_type_ids(batch_ids)
+        else:
+            img_id = getattr(processor, "image_token_id", -1)
+            vid_id = getattr(processor, "video_token_id", -1)
+            mm_type_ids = []
+            for row in batch_ids:
+                mm_type_ids.append([1 if t == img_id else (2 if t == vid_id else 0) for t in row])
+            mm_inputs["mm_token_type_ids"] = mm_type_ids
 
         return mm_inputs
 

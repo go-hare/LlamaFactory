@@ -120,6 +120,28 @@ class LoraArguments:
         default=False,
         metadata={"help": "Whether or not to create a new adapter with randomly initialized weight."},
     )
+    trainable_token_indices: Any = field(
+        default=None,
+        metadata={
+            "help": (
+                "Comma-separated token IDs to selectively train via PEFT `trainable_token_indices` "
+                "(e.g. `6,7,8,9,10,11,12,13` for Gemma-4 `<unused0>~<unused7>` full-duplex control tokens)."
+            )
+        },
+    )
+    trainable_tokens_lr: float | None = field(
+        default=None,
+        metadata={"help": "Dedicated learning rate for PEFT `trainable_tokens` parameters (e.g. `5e-3`)."},
+    )
+    duplex_token_weights: Any = field(
+        default=None,
+        metadata={
+            "help": (
+                "Comma-separated `token_id:weight` pairs for weighted CrossEntropyLoss in full-duplex SFT "
+                "(e.g. `8:8.0,12:6.0,13:6.0,11:4.0`)."
+            )
+        },
+    )
 
 
 @dataclass
@@ -627,6 +649,17 @@ class FinetuningArguments(
         self.lora_target: list[str] = split_arg(self.lora_target)
         self.oft_target: list[str] = split_arg(self.oft_target)
         self.additional_target: list[str] | None = split_arg(self.additional_target)
+        if isinstance(self.trainable_token_indices, str):
+            self.trainable_token_indices = [
+                int(x.strip()) for x in self.trainable_token_indices.split(",") if x.strip()
+            ]
+        if isinstance(self.duplex_token_weights, str):
+            parsed_weights: dict[int, float] = {}
+            for pair in self.duplex_token_weights.split(","):
+                if ":" in pair:
+                    k_str, v_str = pair.split(":", 1)
+                    parsed_weights[int(k_str.strip())] = float(v_str.strip())
+            self.duplex_token_weights = parsed_weights or None
         self.galore_target: list[str] = split_arg(self.galore_target)
         self.apollo_target: list[str] = split_arg(self.apollo_target)
         self.use_ref_model = self.stage == "dpo" and self.pref_loss not in ["orpo", "simpo"]

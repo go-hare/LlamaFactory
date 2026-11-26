@@ -264,6 +264,10 @@ def _setup_lora_tuning(
                 "use_dora": finetuning_args.use_dora,
                 "modules_to_save": finetuning_args.additional_target,
             }
+            if finetuning_args.trainable_token_indices:
+                peft_kwargs["trainable_token_indices"] = finetuning_args.trainable_token_indices
+            if finetuning_args.freeze_vision_tower and getattr(model.config, "model_type", None) in ("gemma4", "gemma3n"):
+                peft_kwargs["exclude_modules"] = r".*(vision_tower|audio_tower).*"
         elif finetuning_args.finetuning_type == "oft":
             peft_kwargs = {
                 "r": finetuning_args.oft_rank,
@@ -306,6 +310,33 @@ def _setup_lora_tuning(
                     **peft_kwargs,
                 )
             model = get_peft_model(model, peft_config)
+
+            # Semantic delta warm-start for PEFT TrainableTokensWrapper (avoids base_layer mismatch on reload)
+            if (
+                is_trainable
+                and finetuning_args.trainable_token_indices
+                and getattr(model_args, "_special_token_descriptions", None)
+            ):
+                try:
+                    from transformers import AutoTokenizer
+
+                    tok = AutoTokenizer.from_pretrained(model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code)
+                    emb_mod = model.get_input_embeddings()
+                    if hasattr(emb_mod, "token_adapter"):
+                        with torch.no_grad():
+                            base_w = emb_mod.token_adapter.base_layer.weight
+                            delta_p = emb_mod.token_adapter.trainable_tokens_delta["default"]
+                            desc_map = model_args._special_token_descriptions
+                            idx_to_pos = {tid: pos for pos, tid in enumerate(finetuning_args.trainable_token_indices)}
+                            for tok_str, desc_text in desc_map.items():
+                                tid = tok.convert_tokens_to_ids(tok_str)
+                                ref_ids = tok.encode(str(desc_text), add_special_tokens=False)
+                                if tid in idx_to_pos and ref_ids:
+                                    target_v = base_w[ref_ids].mean(dim=0)
+                                    delta_p[idx_to_pos[tid]].copy_((target_v - base_w[tid]).to(delta_p.dtype))
+                        logger.info_rank0("Initialized PEFT trainable_tokens_delta from semantic descriptions.")
+                except Exception as exc:
+                    logger.warning_rank0(f"Skipped semantic trainable_tokens_delta init: {exc}")
 
     if is_trainable and cast_trainable_params_to_fp32:
         for param in filter(lambda p: p.requires_grad, model.parameters()):

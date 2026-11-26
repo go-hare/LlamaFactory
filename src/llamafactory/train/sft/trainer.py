@@ -123,6 +123,22 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 asft_loss_func,
                 asft_alpha=finetuning_args.asft_alpha,
             )
+        elif finetuning_args.duplex_token_weights:
+            weight_map: dict[int, float] = finetuning_args.duplex_token_weights
+
+            def _duplex_weighted_ce(outputs, labels, num_items_in_batch=None):
+                logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
+                shift_logits = logits[..., :-1, :].contiguous().float()
+                shift_labels = labels[..., 1:].contiguous()
+                vocab_size = shift_logits.size(-1)
+                w = torch.ones(vocab_size, dtype=torch.float32, device=shift_logits.device)
+                for tid, val in weight_map.items():
+                    if 0 <= tid < vocab_size:
+                        w[tid] = float(val)
+                loss_fct = torch.nn.CrossEntropyLoss(weight=w, ignore_index=IGNORE_INDEX)
+                return loss_fct(shift_logits.view(-1, vocab_size), shift_labels.view(-1))
+
+            self.compute_loss_func = _duplex_weighted_ce
 
         if training_args.fp8 and hasattr(self, "accelerator"):  # verify FP8 status after trainer initialization
             verify_fp8_status(self.accelerator, training_args)
