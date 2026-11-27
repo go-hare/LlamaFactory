@@ -1,0 +1,49 @@
+### model
+model_name_or_path: google/gemma-4-E2B-it
+image_max_pixels: 262144
+video_max_pixels: 16384
+trust_remote_code: true
+add_special_tokens: "<unused0>,<unused1>,<unused2>,<unused3>,<unused4>,<unused5>,<unused6>,<unused7>"
+
+### method
+stage: sft
+do_train: true
+finetuning_type: lora
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_target: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
+trainable_token_indices: [6, 7, 8, 9, 10, 11, 12, 13]
+
+### dataset
+dataset: gemma4_route2_stage1
+eval_dataset: gemma4_route2_stage1_valid
+template: gemma4n_duplex
+cutoff_len: 2048
+packing: false
+overwrite_cache: true
+preprocessing_num_workers: 4
+
+### output
+output_dir: outputs/gemma4_route2_stage1_lora
+logging_steps: 50
+save_steps: 100
+eval_strategy: steps
+eval_steps: 65
+plot_loss: false
+overwrite_output_dir: true
+save_only_model: true
+report_to: none
+
+### train
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 4
+learning_rate: 1.5e-4
+num_train_epochs: 3.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.08
+bf16: true
+ddp_timeout: 180000000
+
+### eval
+per_device_eval_batch_size: 4

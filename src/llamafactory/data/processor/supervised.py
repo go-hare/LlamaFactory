@@ -59,17 +59,31 @@ class SupervisedDatasetProcessor(DatasetProcessor):
         videos: list["VideoInput"],
         audios: list["AudioInput"],
     ) -> tuple[list[int], list[int]]:
-        messages = self.template.mm_plugin.process_messages(prompt + response, images, videos, audios, self.processor)
+        raw_messages = [dict(m) for m in (prompt + response)]
+        masked_turn_modes: dict[int, str] = {}
+        for m_idx in range(1, len(raw_messages), 2):
+            content = raw_messages[m_idx].get("content", "")
+            if isinstance(content, str):
+                if content.startswith("<|mask_turn|>"):
+                    raw_messages[m_idx]["content"] = content[len("<|mask_turn|>") :]
+                    masked_turn_modes[m_idx // 2] = "all"
+                elif "<|mask_after_state|>" in content:
+                    raw_messages[m_idx]["content"] = content.replace("<|mask_after_state|>", "", 1)
+                    masked_turn_modes[m_idx // 2] = "after_state"
+
+        messages = self.template.mm_plugin.process_messages(raw_messages, images, videos, audios, self.processor)
         input_ids, labels = self.template.mm_plugin.process_token_ids(
             [], [], images, videos, audios, self.tokenizer, self.processor
         )
         discarding_history_cot = self.data_args.mask_history and not self.template.preserve_thinking
         encoded_pairs = self.template.encode_multiturn(self.tokenizer, messages, system, tools, discarding_history_cot)
+        num_pairs = len(encoded_pairs)
         total_length = len(input_ids) + (1 if self.template.efficient_eos else 0)
         if self.data_args.mask_history:
             encoded_pairs = encoded_pairs[::-1]  # high priority for last turns
 
         for turn_idx, (source_ids, target_ids) in enumerate(encoded_pairs):
+            orig_turn_idx = (num_pairs - 1 - turn_idx) if self.data_args.mask_history else turn_idx
             if total_length >= self.data_args.cutoff_len:
                 break
 
@@ -87,8 +101,14 @@ class SupervisedDatasetProcessor(DatasetProcessor):
             else:
                 source_label = [IGNORE_INDEX] * source_len
 
+            mask_mode = masked_turn_modes.get(orig_turn_idx)
             if self.data_args.mask_history and turn_idx != 0:  # train on the last turn only
                 target_label = [IGNORE_INDEX] * target_len
+            elif mask_mode == "all":
+                target_label = [IGNORE_INDEX] * target_len
+            elif mask_mode == "after_state":
+                keep_n = 1 if target_len >= 1 else 0
+                target_label = target_ids[:keep_n] + [IGNORE_INDEX] * (target_len - keep_n)
             else:
                 target_label = target_ids
 

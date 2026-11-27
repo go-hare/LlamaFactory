@@ -181,3 +181,6 @@ wandb/
 swanlog/
 generated_predictions.jsonl
 predictions_score.json
+data/gemma4_route2_stage1/
+data/gemma4_route2_stage2/
+data/_route2_hf_staging/

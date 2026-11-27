@@ -817,5 +817,23 @@
       "tools": "tools",
       "audios": "audios"
     }
+  },
+  "gemma4_route2_stage1": {
+    "file_name": "gemma4_route2_stage1/train.json",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "conversations",
+      "tools": "tools",
+      "audios": "audios"
+    }
+  },
+  "gemma4_route2_stage1_valid": {
+    "file_name": "gemma4_route2_stage1/valid.json",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "conversations",
+      "tools": "tools",
+      "audios": "audios"
+    }
   }
 }
