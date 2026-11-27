@@ -122,9 +122,9 @@ def main() -> None:
         return tokenizer.encode(s, add_special_tokens=False)
 
     sys_prompt = (
-        "<|turn>system\nYou are a real-time full-duplex voice assistant.\n"
-        "<|tool>declaration:get_weather{description:<|\"|>执行 get_weather<|\"|>,"
-        "parameters:{properties:{city:{type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|>"
+        "<|turn>system\nYou are a real-time full-duplex voice assistant."
+        "declaration:get_weather{description:<|\"|>执行 get_weather<|\"|>,"
+        "parameters:{properties:{city:{type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}"
         "<turn|>\n"
     )
 
