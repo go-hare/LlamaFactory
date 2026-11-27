@@ -19,7 +19,6 @@ import torch
 import torch.nn.functional as F
 import torchaudio
 import torchaudio.compliance.kaldi as kaldi
-import whisper
 from huggingface_hub import snapshot_download
 from omegaconf import DictConfig
 
@@ -121,6 +120,25 @@ def _fade_in_out(fade_in_mel: torch.Tensor, fade_out_mel: torch.Tensor, window: 
     return fade_in_cpu.to(device)
 
 
+def extract_whisper_log_mel_128(wav_16k: torch.Tensor) -> torch.Tensor:
+    """Bit-exact pure-PyTorch Whisper 128-bin log-mel spectrogram (zero openai-whisper dependency)."""
+    pad_samples = 16000 * 30
+    if wav_16k.shape[-1] < pad_samples:
+        wav_p = F.pad(wav_16k, (0, pad_samples - wav_16k.shape[-1]))
+    else:
+        wav_p = wav_16k[..., :pad_samples]
+    window = torch.hann_window(400, device=wav_p.device)
+    stft = torch.stft(wav_p.float(), n_fft=400, hop_length=160, window=window, return_complex=True)
+    magnitudes = stft[..., :-1].abs() ** 2
+    filters = torchaudio.functional.melscale_fbanks(
+        n_freqs=201, f_min=0.0, f_max=8000.0, n_mels=128, sample_rate=16000, norm="slaney", mel_scale="slaney"
+    ).T.to(wav_p.device)
+    mel_spec = filters @ magnitudes
+    log_spec = torch.clamp(mel_spec, min=1e-10).log10()
+    log_spec = torch.maximum(log_spec, log_spec.max() - 8.0)
+    return (log_spec + 4.0) / 4.0
+
+
 class SpeechTokenizerV2:
     """Extracts exact 25Hz discrete FSQ speech units (0..6560) using CosyVoice2 speech_tokenizer_v2.onnx."""
 
@@ -144,7 +162,8 @@ class SpeechTokenizerV2:
             wav = wav[:, : 16000 * 30]
         if wav.shape[1] < 400:
             return []
-        feat = whisper.log_mel_spectrogram(wav, n_mels=128)  # [1, 128, T_mel]
+        valid_frames = wav.shape[1] // 160
+        feat = extract_whisper_log_mel_128(wav)[..., :valid_frames]  # [1, 128, T_mel]
         out = self.session.run(
             None,
             {
