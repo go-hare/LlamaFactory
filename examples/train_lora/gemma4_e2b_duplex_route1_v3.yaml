@@ -1,0 +1,54 @@
+### model
+model_name_or_path: google/gemma-4-E2B-it
+trust_remote_code: true
+new_special_tokens_config: examples/train_lora/gemma4_duplex_tokens.yaml
+resize_vocab: false
+
+### method
+stage: sft
+do_train: true
+finetuning_type: lora
+lora_rank: 32
+lora_alpha: 64
+lora_dropout: 0.05
+lora_target: q_proj,v_proj,k_proj,o_proj
+freeze_vision_tower: true
+freeze_multi_modal_projector: true
+trainable_token_indices: "6,7,8,9,10,11,12,13"
+trainable_tokens_lr: 5.0e-3
+duplex_token_weights: "8:8.0,9:4.0,11:5.0,12:6.0,13:7.0"
+
+### dataset
+dataset: gemma4_duplex_route1_v3
+eval_dataset: gemma4_duplex_route1_v3_valid
+template: gemma4n_duplex
+cutoff_len: 2048
+overwrite_cache: true
+preprocessing_num_workers: 8
+dataloader_num_workers: 4
+
+### output
+output_dir: saves/gemma4-e2b/lora/duplex_route1_v3
+logging_steps: 100
+save_steps: 500
+save_total_limit: 3
+overwrite_output_dir: true
+save_only_model: true
+report_to: none
+
+### train (A100 80G: 等效 batch_size = 4x2 = 8)
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 2
+learning_rate: 2.0e-4
+num_train_epochs: 2.0
+lr_scheduler_type: cosine
+warmup_steps: 120
+bf16: true
+gradient_checkpointing: true
+ddp_timeout: 180000000
+
+### eval
+per_device_eval_batch_size: 4
+eval_strategy: steps
+eval_steps: 500
+prediction_loss_only: true
