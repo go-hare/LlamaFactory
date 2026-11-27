@@ -1,0 +1,59 @@
+### model
+model_name_or_path: google/gemma-4-E2B-it
+trust_remote_code: true
+# 激活 Gemma-4 原词表预留槽位 ID 6~13 (<unused0>~<unused7>) 为单 Token 控制符，不扩容 262144 词表
+new_special_tokens_config: examples/train_lora/gemma4_duplex_tokens.yaml
+resize_vocab: false
+
+### method
+stage: sft
+do_train: true
+finetuning_type: lora
+# v2 真实音频量扩容 25x，LoRA 秩提升至 32（适配器仍仅 ~42MB）以容纳更丰富的声学边界与多域异步工具
+lora_rank: 32
+lora_alpha: 64
+lora_dropout: 0.05
+lora_target: q_proj,v_proj,k_proj,o_proj
+# 冻结原装 300M gemma4_audio 音频编码器与视觉编码器
+freeze_vision_tower: true
+freeze_multi_modal_projector: true
+# 零拷贝稀疏训练 ID 6~13 全双工状态机槽位增量
+trainable_token_indices: "6,7,8,9,10,11,12,13"
+trainable_tokens_lr: 5.0e-3
+# 全双工关键状态 Token 加权交叉熵 Loss (8:接话开口, 9:等待后台工具, 11:远场/杂音抗噪忽略, 12:近场真打断, 13:作废旧工具)
+duplex_token_weights: "8:8.0,9:4.0,11:5.0,12:6.0,13:7.0"
+
+### dataset
+dataset: gemma4_duplex_route1_v2
+eval_dataset: gemma4_duplex_route1_v2_valid
+template: gemma4n_duplex
+cutoff_len: 2048
+overwrite_cache: true
+preprocessing_num_workers: 8
+dataloader_num_workers: 4
+
+### output
+output_dir: saves/gemma4-e2b/lora/duplex_route1_v2
+logging_steps: 50
+save_steps: 400
+save_total_limit: 3
+overwrite_output_dir: true
+save_only_model: true
+report_to: none
+
+### train (A100 80G 推荐配置；等效 batch_size = 4x2 = 8)
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 2
+learning_rate: 2.0e-4
+num_train_epochs: 2.0
+lr_scheduler_type: cosine
+warmup_steps: 100
+bf16: true
+gradient_checkpointing: true
+ddp_timeout: 180000000
+
+### eval
+per_device_eval_batch_size: 4
+eval_strategy: steps
+eval_steps: 400
+prediction_loss_only: true

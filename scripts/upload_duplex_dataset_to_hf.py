@@ -30,7 +30,8 @@ def main() -> None:
 
     train_n = len(json.loads(train_p.read_text(encoding="utf-8")))
     valid_n = len(json.loads(valid_p.read_text(encoding="utf-8")))
-    wav_cnt = len(list((data_dir / "audios").glob("*.wav"))) if (data_dir / "audios").exists() else 0
+    wav_cnt = len(list((data_dir / "audios").rglob("*.wav"))) + len(list((data_dir / "audios").rglob("*.flac"))) if (data_dir / "audios").exists() else 0
+    has_tar = (data_dir / "audios.tar").exists()
 
     readme_md = f"""---
 license: apache-2.0
@@ -50,7 +51,7 @@ tags:
 
 - **Train samples**: {train_n}
 - **Valid samples**: {valid_n}
-- **16kHz acoustic clips (`audios/*.wav`)**: {wav_cnt} (AudioSet environmental noise, MIT RIR far-field reverberant bystander speech, and multi-speaker near-field Mandarin utterances)
+- **16kHz acoustic clips**: {wav_cnt} ({'packed in `audios.tar` (lossless 16kHz FLAC)' if has_tar else '`audios/*.wav`'})
 - **Control token slots**: `<unused0>` ~ `<unused7>` (Gemma-4 native IDs `6..13`, zero vocab expansion)
 """
     (data_dir / "README.md").write_text(readme_md, encoding="utf-8")
@@ -60,13 +61,18 @@ tags:
     print(f"[HF] 当前登录账号: {user} | 目标数据集仓库: {args.hf_repo} (private={args.private})")
     api.create_repo(repo_id=args.hf_repo, repo_type="dataset", private=args.private, exist_ok=True)
 
-    print(f"[HF] 正在上传 {data_dir} (train={train_n}, valid={valid_n}, wavs={wav_cnt})...")
+    ignore = [".gitignore", ".DS_Store", "tmp_*", "*.aiff"]
+    if has_tar:
+        ignore.append("audios/**")
+        ignore.append("audios")
+
+    print(f"[HF] 正在上传 {data_dir} (train={train_n}, valid={valid_n}, clips={wav_cnt}, packed_tar={has_tar})...")
     api.upload_folder(
         folder_path=str(data_dir),
         repo_id=args.hf_repo,
         repo_type="dataset",
-        ignore_patterns=[".gitignore", ".DS_Store", "tmp_*", "*.aiff"],
-        commit_message=f"Upload Gemma-4 Route-1 full-duplex dataset (train={train_n}, valid={valid_n}, wavs={wav_cnt})",
+        ignore_patterns=ignore,
+        commit_message=f"Upload Gemma-4 Route-1 full-duplex dataset (train={train_n}, valid={valid_n}, clips={wav_cnt})",
     )
     print(f"✅ 数据集已成功上传至: https://huggingface.co/datasets/{args.hf_repo}")
 

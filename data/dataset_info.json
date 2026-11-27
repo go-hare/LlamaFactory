@@ -763,5 +763,23 @@
       "tools": "tools",
       "audios": "audios"
     }
+  },
+  "gemma4_duplex_route1_v2": {
+    "file_name": "gemma4_duplex_route1_v2/train.json",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "conversations",
+      "tools": "tools",
+      "audios": "audios"
+    }
+  },
+  "gemma4_duplex_route1_v2_valid": {
+    "file_name": "gemma4_duplex_route1_v2/valid.json",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "conversations",
+      "tools": "tools",
+      "audios": "audios"
+    }
   }
 }
