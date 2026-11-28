@@ -1204,10 +1204,10 @@ def create_app(engine: Route2OmniEngine) -> FastAPI:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--base_model", type=str, default="google/gemma-4-E2B-it")
-    parser.add_argument("--stage1_adapter", type=str, default="")
-    parser.add_argument("--stage2_talker", type=str, default="")
-    parser.add_argument("--prompt_wav", type=str, default=None)
+    parser.add_argument("--base_model", "--base-model", dest="base_model", type=str, default="google/gemma-4-E2B-it")
+    parser.add_argument("--stage1_adapter", "--stage1-adapter", dest="stage1_adapter", type=str, default="")
+    parser.add_argument("--stage2_talker", "--stage2-talker", dest="stage2_talker", type=str, default="")
+    parser.add_argument("--prompt_wav", "--prompt-wav", dest="prompt_wav", type=str, default=None)
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=7860)
     args = parser.parse_args()
