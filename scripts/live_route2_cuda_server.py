@@ -277,8 +277,8 @@ class Route2OmniEngine:
             t0 = time.perf_counter()
             rms = float(np.sqrt(np.mean(wav_048s**2) + 1e-12))
             wav_use = wav_048s.astype(np.float32)
-            if rms > 1e-4:
-                gain = min(4.0, 0.085 / rms)
+            if rms >= 0.016:
+                gain = min(3.5, 0.085 / rms)
                 wav_use = np.clip(wav_use * gain, -0.96, 0.96)
 
             feat = self.fe([wav_use], sampling_rate=SR_IN, return_tensors="pt")
@@ -417,7 +417,7 @@ class Route2OmniEngine:
                     temperature=0.0,
                 )
                 if u_chunk or is_end:
-                    pcm_f32 = self.vocoder.push_units(u_chunk, voc_sess, finalize=is_end, min_chunk_units=8)
+                    pcm_f32 = self.vocoder.push_units(u_chunk, voc_sess, finalize=is_end, min_chunk_units=6)
                     if len(pcm_f32) > 0:
                         if first_audio_ms is None:
                             first_audio_ms = (time.perf_counter() - t_start) * 1000.0
@@ -813,7 +813,47 @@ def create_app(engine: Route2OmniEngine) -> FastAPI:
                 elif mtype == "text_sim":
                     abort_event.set()
                     await asyncio.sleep(0.02)
-                    asyncio.create_task(run_streaming_turn("text", text_query=data["text"]))
+                    # Synthesize true 16kHz spoken frames so native audio Thinker runs in 100% authentic audio mode!
+                    sim_text = str(data["text"])
+
+                    async def _run_audio_sim(q_txt: str) -> None:
+                        import io
+                        import av
+                        import edge_tts
+
+                        comm = edge_tts.Communicate(q_txt, "zh-CN-YunxiNeural")
+                        mp3_buf = bytearray()
+                        async for chunk in comm.stream():
+                            if chunk["type"] == "audio":
+                                mp3_buf.extend(chunk["data"])
+                        container = av.open(io.BytesIO(bytes(mp3_buf)))
+                        resampler = av.AudioResampler(format="fltp", layout="mono", rate=SR_IN)
+                        arrs = []
+                        for fr in container.decode(audio=0):
+                            for ofr in resampler.resample(fr):
+                                arrs.append(ofr.to_ndarray()[0])
+                        for ofr in resampler.resample(None):
+                            arrs.append(ofr.to_ndarray()[0])
+                        wav_sim = np.concatenate(arrs).astype(np.float32) if arrs else np.zeros(CHUNK_SAMPLES, dtype=np.float32)
+                        # Trim edge-tts leading/trailing silence so only active speech frames (>=0.012 RMS) enter prefill_audio_tick
+                        win = 400
+                        nf = len(wav_sim) // win
+                        if nf > 2:
+                            f_rms = np.sqrt(np.mean(wav_sim[: nf * win].reshape(nf, win) ** 2, axis=1))
+                            nz = np.where(f_rms > 0.010)[0]
+                            if len(nz) > 0:
+                                wav_sim = wav_sim[max(0, (nz[0] - 1) * win) : min(len(wav_sim), (nz[-1] + 2) * win)]
+                        for start in range(0, len(wav_sim), CHUNK_SAMPLES):
+                            seg = wav_sim[start : start + CHUNK_SAMPLES]
+                            if start > 0 and len(seg) < 1600:
+                                break
+                            if len(seg) < CHUNK_SAMPLES:
+                                seg = np.pad(seg, (0, CHUNK_SAMPLES - len(seg)))
+                            st, ms = await loop.run_in_executor(None, engine.prefill_audio_tick, seg)
+                            await send_json({"type": "state", "state": st, "ms": ms})
+                        await run_streaming_turn("silence")
+
+                    asyncio.create_task(_run_audio_sim(sim_text))
 
                 elif mtype == "mic_frame":
                     pcm_bytes = base64.b64decode(data["pcm16_b64"])

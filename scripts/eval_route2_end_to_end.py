@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-End-to-End Automated Sanity & Latency Benchmark for Gemma-4-E2B Route 2 (II-A):
-Tests:
-  1. Greeting ("你好") with ALL 9 tools active -> NO false tool call + intelligible 24kHz speech
+End-to-End True Native Audio Sanity & Latency Benchmark for Gemma-4-E2B Route 2 (II-A):
+Feeds real 0.48s 16kHz spoken audio frames + <unused0> silence endpoint into Route2OmniEngine and tests:
+  1. Greeting ("你好") with ALL 9 tools active -> NO false tool call + crisp ~2.5s 24kHz speech
   2. Identity ("你叫什么名字") with ALL 9 tools active -> clean persona (zero "小明" / zero parrot)
-  3. Zero-ASR Async Tool Call -> exact <unused3><|tool_call> + spoken ack without reading JSON aloud
-  4. First-Packet Audio Latency (TTFA in ms) on GPU
+  3. Zero-ASR Async Tool Call ("帮我查一下明天上海的天气怎么样") -> exact <unused3><|tool_call> + spoken ack
+  4. First-Packet Audio Latency (TTFA in ms after user speech ends)
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
+import io
 import os
 import sys
 import time
@@ -18,6 +20,8 @@ from pathlib import Path
 
 os.environ.setdefault("DISABLE_VERSION_CHECK", "1")
 
+import av
+import edge_tts
 import numpy as np
 import soundfile as sf
 
@@ -26,7 +30,40 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
-from live_route2_cuda_server import Route2OmniEngine  # noqa: E402
+from live_route2_cuda_server import CHUNK_SAMPLES, SR_IN, Route2OmniEngine  # noqa: E402
+
+
+async def synth_16k_frames(text: str, voice: str = "zh-CN-YunxiNeural") -> list[np.ndarray]:
+    comm = edge_tts.Communicate(text, voice)
+    buf = bytearray()
+    async for msg in comm.stream():
+        if msg["type"] == "audio":
+            buf.extend(msg["data"])
+    container = av.open(io.BytesIO(bytes(buf)))
+    resampler = av.AudioResampler(format="fltp", layout="mono", rate=SR_IN)
+    chunks = []
+    for fr in container.decode(audio=0):
+        for ofr in resampler.resample(fr):
+            chunks.append(ofr.to_ndarray()[0])
+    for ofr in resampler.resample(None):
+        chunks.append(ofr.to_ndarray()[0])
+    wav = np.concatenate(chunks).astype(np.float32)
+    win = 400
+    nf = len(wav) // win
+    if nf > 2:
+        f_rms = np.sqrt(np.mean(wav[: nf * win].reshape(nf, win) ** 2, axis=1))
+        nz = np.where(f_rms > 0.010)[0]
+        if len(nz) > 0:
+            wav = wav[max(0, (nz[0] - 1) * win) : min(len(wav), (nz[-1] + 2) * win)]
+    frames = []
+    for s in range(0, len(wav), CHUNK_SAMPLES):
+        seg = wav[s : s + CHUNK_SAMPLES]
+        if s > 0 and len(seg) < 1600:
+            break
+        if len(seg) < CHUNK_SAMPLES:
+            seg = np.pad(seg, (0, CHUNK_SAMPLES - len(seg)))
+        frames.append(seg)
+    return frames
 
 
 def main() -> None:
@@ -52,9 +89,15 @@ def main() -> None:
         ("weather_tool_call", "帮我查一下明天上海的天气怎么样"),
     ]
 
-    print("\n================ ROUTE 2 END-TO-END BENCHMARK ================")
-    for tag, prompt in cases:
+    print("\n================ ROUTE 2 TRUE AUDIO-TO-SPEECH BENCHMARK ================")
+    for tag, spoken_input in cases:
         engine.reset_context()
+        frames = asyncio.run(synth_16k_frames(spoken_input))
+        frame_states = []
+        for fr in frames:
+            st, _ = engine.prefill_audio_tick(fr)
+            frame_states.append(st)
+
         pcm_parts = []
         tool_calls = []
         raw_out = ""
@@ -62,7 +105,7 @@ def main() -> None:
         ttfa = 0.0
         t0 = time.perf_counter()
 
-        for ev in engine.stream_response_generator(trigger_mode="text", text_query=prompt):
+        for ev in engine.stream_response_generator(trigger_mode="silence"):
             if ev[0] == "tool_call":
                 tool_calls.append(ev[1])
             elif ev[0] == "audio_pcm":
@@ -75,13 +118,13 @@ def main() -> None:
         wav_p = out_dir / f"{tag}.wav"
         sf.write(str(wav_p), wav, 24000)
         print(
-            f"[{tag}] Prompt='{prompt}'\n"
+            f"[{tag}] Audio In='{spoken_input}' ({len(frames)}x0.48s -> {frame_states})\n"
             f"  Raw Thinker : {raw_out}\n"
             f"  Spoken Text : {spoken_out}\n"
             f"  Tool Calls  : {tool_calls}\n"
             f"  Audio Out   : {len(wav)/24000:.2f}s @ 24kHz | TTFA = {ttfa:.1f} ms | Total = {total_ms:.1f} ms -> {wav_p}"
         )
-    print("==============================================================")
+    print("========================================================================")
 
 
 if __name__ == "__main__":

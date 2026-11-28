@@ -283,9 +283,10 @@ class Cosy2StreamingVocoder:
             sess_options=opt,
             providers=["CPUExecutionProvider"],
         )
-        self.speech_tokenizer = SpeechTokenizerV2(
+        # Run one-time prompt unit extraction strictly on CPU so onnxruntime never hijacks CUDA VRAM arena!
+        speech_tok_cpu = SpeechTokenizerV2(
             os.path.join(model_dir, "speech_tokenizer_v2.onnx"),
-            prefer_cuda=(self.device.type == "cuda"),
+            prefer_cuda=False,
         )
 
         self.flow, self.hift = _build_cosy2_flow_and_hift()
@@ -312,7 +313,10 @@ class Cosy2StreamingVocoder:
         self.hift_cache_dict: dict[str, Optional[dict]] = {}
 
         ref_wav = prompt_wav_path or DEFAULT_PROMPT_ZH_WAV
-        self.default_speaker_ctx = self.prepare_speaker_context(ref_wav, use_zero_shot_prompt=use_zero_shot_prompt)
+        self.default_speaker_ctx = self.prepare_speaker_context(
+            ref_wav, use_zero_shot_prompt=use_zero_shot_prompt, speech_tokenizer=speech_tok_cpu
+        )
+        del speech_tok_cpu
 
     def extract_spk_embedding(self, speech_16k: torch.Tensor) -> torch.Tensor:
         feat = kaldi.fbank(speech_16k, num_mel_bins=80, dither=0, sample_frequency=16000)
@@ -323,11 +327,16 @@ class Cosy2StreamingVocoder:
         )[0].flatten()
         return torch.from_numpy(emb).unsqueeze(0).float().to(self.device)
 
-    def prepare_speaker_context(self, prompt_wav_path: str, use_zero_shot_prompt: bool = True) -> dict[str, torch.Tensor]:
+    def prepare_speaker_context(
+        self,
+        prompt_wav_path: str,
+        use_zero_shot_prompt: bool = True,
+        speech_tokenizer: Optional[SpeechTokenizerV2] = None,
+    ) -> dict[str, torch.Tensor]:
         speech_16k = load_mono_audio(prompt_wav_path, target_sr=16000)
-        # Keep prompt crisp (~3.2s max) so streaming flow latency stays <25ms per chunk
-        if speech_16k.shape[1] > int(16000 * 3.2):
-            speech_16k = speech_16k[:, : int(16000 * 3.2)]
+        # Keep prompt crisp (~1.5s) so streaming flow latency stays <18ms per chunk on CUDA
+        if speech_16k.shape[1] > int(16000 * 1.5):
+            speech_16k = speech_16k[:, : int(16000 * 1.5)]
         embedding = self.extract_spk_embedding(speech_16k)
         if not use_zero_shot_prompt:
             return {
@@ -335,7 +344,10 @@ class Cosy2StreamingVocoder:
                 "prompt_token": torch.zeros(1, 0, dtype=torch.int32, device=self.device),
                 "prompt_feat": torch.zeros(1, 0, 80, dtype=torch.float32, device=self.device),
             }
-        units = self.speech_tokenizer.extract_units(speech_16k)
+        tok_inst = speech_tokenizer or SpeechTokenizerV2(
+            os.path.join(self.model_dir, "speech_tokenizer_v2.onnx"), prefer_cuda=False
+        )
+        units = tok_inst.extract_units(speech_16k)
         speech_24k = torchaudio.transforms.Resample(orig_freq=16000, new_freq=24000)(speech_16k)
         mel = extract_cosy2_mel_24k(speech_24k).transpose(1, 2).to(self.device)  # [1, T_mel, 80]
         tok_len = min(mel.shape[1] // 2, len(units))
@@ -383,16 +395,18 @@ class Cosy2StreamingVocoder:
         token_offset: int,
         finalize: bool = False,
     ) -> torch.Tensor:
-        tts_mel, _ = self.flow.inference(
-            token=token.to(self.device),
-            token_len=torch.tensor([token.shape[1]], dtype=torch.int32, device=self.device),
-            prompt_token=prompt_token,
-            prompt_token_len=torch.tensor([prompt_token.shape[1]], dtype=torch.int32, device=self.device),
-            prompt_feat=prompt_feat,
-            prompt_feat_len=torch.tensor([prompt_feat.shape[1]], dtype=torch.int32, device=self.device),
-            embedding=embedding,
-            finalize=finalize,
-        )
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=(self.device.type == "cuda")):
+            tts_mel, _ = self.flow.inference(
+                token=token.to(self.device),
+                token_len=torch.tensor([token.shape[1]], dtype=torch.int32, device=self.device),
+                prompt_token=prompt_token,
+                prompt_token_len=torch.tensor([prompt_token.shape[1]], dtype=torch.int32, device=self.device),
+                prompt_feat=prompt_feat,
+                prompt_feat_len=torch.tensor([prompt_feat.shape[1]], dtype=torch.int32, device=self.device),
+                embedding=embedding,
+                finalize=finalize,
+            )
+        tts_mel = tts_mel.float()
         tts_mel = tts_mel[:, :, token_offset * self.flow.token_mel_ratio :]
         if tts_mel.shape[2] == 0:
             return torch.zeros(1, 0, dtype=torch.float32, device=self.device)
@@ -429,7 +443,7 @@ class Cosy2StreamingVocoder:
         new_units: list[int],
         session: dict,
         finalize: bool = False,
-        min_chunk_units: int = 8,
+        min_chunk_units: int = 6,
     ) -> np.ndarray:
         """Push newly generated 25Hz units (0..6560) and return ready 24kHz float32 PCM samples."""
         if new_units:

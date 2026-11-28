@@ -43,6 +43,7 @@ class TalkerStreamSession:
     buffered_hiddens: list[torch.Tensor] = field(default_factory=list)
     in_tool_call: bool = False
     recent_unit_ids: list[int] = field(default_factory=list)
+    spoken_char_count: int = 0
     finished: bool = False
 
     def reset(self) -> None:
@@ -54,6 +55,7 @@ class TalkerStreamSession:
         self.buffered_hiddens.clear()
         self.in_tool_call = False
         self.recent_unit_ids.clear()
+        self.spoken_char_count = 0
         self.finished = False
 
 
@@ -397,7 +399,11 @@ class Gemma4SpeechGenerator(nn.Module):
         )
         logits = out.logits[0, -1, :].float()
 
-        max_steps = self.write_len if not is_finished else 300
+        if not is_finished:
+            max_steps = self.write_len
+        else:
+            est_cap = max(24, session.spoken_char_count * 7 - len(session.recent_unit_ids) + 18)
+            max_steps = min(180, est_cap) if session.spoken_char_count > 0 else 180
         emitted_units: list[int] = []
         u_start = self.unit_offset
         u_end = self.unit_offset + UNIT_VOCAB_SIZE  # 158227
@@ -495,6 +501,7 @@ class Gemma4SpeechGenerator(nn.Module):
             avg_h = torch.stack(session.pending_gemma_hiddens, dim=0).mean(dim=0)
             session.pending_gemma_ids.clear()
             session.pending_gemma_hiddens.clear()
+            session.spoken_char_count += len(piece.strip())
 
             sub_ids = self.tokenizer.encode(piece, add_special_tokens=False)
             for sid in sub_ids:
