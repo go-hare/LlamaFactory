@@ -571,3 +571,104 @@ class Gemma4SpeechGenerator(nn.Module):
             fused = torch.zeros((0, self.model.config.hidden_size), dtype=dtype, device=device)
 
         return self._decode_unit_chunk(fused, session, is_finished=True, temperature=temperature)
+
+    @torch.inference_mode()
+    def iter_turn_end_chunks(
+        self,
+        gemma_pred_hidden: torch.Tensor,
+        session: TalkerStreamSession,
+        temperature: float = 0.55,
+        top_k: int = 15,
+        subchunk_size: int = 12,
+    ):
+        """Stream final-cycle speech units in fast 12-unit GPU batches so post-<sep> audio never stalls Chunk 0."""
+        if session.finished or (not session.buffered_tts_ids and len(session.recent_unit_ids) == 0):
+            session.finished = True
+            yield [], True
+            return
+
+        device = gemma_pred_hidden.device
+        dtype = self.input_proj[0].weight.dtype
+        embed_fn = self.model.get_input_embeddings()
+
+        if session.buffered_tts_ids:
+            c_ids = torch.tensor(session.buffered_tts_ids, dtype=torch.long, device=device)
+            c_hid = torch.stack(session.buffered_hiddens, dim=0)
+            session.buffered_tts_ids.clear()
+            session.buffered_hiddens.clear()
+            fused, _ = self.fuse_representations(c_hid, c_ids)
+        else:
+            fused = torch.zeros((0, self.model.config.hidden_size), dtype=dtype, device=device)
+
+        sep_emb = embed_fn(torch.tensor([self.sep_token_id], dtype=torch.long, device=device)).to(dtype=dtype)
+        new_embeds = torch.cat([fused, sep_emb], dim=0)
+
+        out = self.model(
+            inputs_embeds=new_embeds.unsqueeze(0),
+            past_key_values=session.kv_cache,
+            use_cache=True,
+            logits_to_keep=1,
+            return_dict=True,
+        )
+        logits = out.logits[0, -1, :].float()
+
+        est_cap = max(24, session.spoken_char_count * 6 - len(session.recent_unit_ids) + 14)
+        max_steps = min(160, est_cap) if session.spoken_char_count > 0 else 160
+        u_start = self.unit_offset
+        u_end = self.unit_offset + UNIT_VOCAB_SIZE
+
+        buf_units: list[int] = []
+        steps_done = 0
+        # Run 4 GPU steps per batch before checking <eos> on CPU (cuts CPU-GPU syncs by 4x!)
+        while steps_done < max_steps and not session.finished:
+            batch_n = min(4, max_steps - steps_done)
+            gpu_choices: list[torch.Tensor] = []
+            penalize_u: list[int] = []
+            if len(session.recent_unit_ids) >= 8 and len(set(session.recent_unit_ids[-8:])) == 1:
+                penalize_u = [session.recent_unit_ids[-1] - u_start]
+            elif len(session.recent_unit_ids) >= 10 and len(set(session.recent_unit_ids[-10:])) <= 2:
+                penalize_u = [sid - u_start for sid in set(session.recent_unit_ids[-10:])]
+
+            for _ in range(batch_n):
+                cand_logits = torch.empty(UNIT_VOCAB_SIZE + 1, dtype=logits.dtype, device=device)
+                cand_logits[:UNIT_VOCAB_SIZE] = logits[u_start:u_end]
+                cand_logits[UNIT_VOCAB_SIZE] = logits[self.eos_token_id]
+                for pu in penalize_u:
+                    if 0 <= pu < UNIT_VOCAB_SIZE:
+                        cand_logits[pu] -= 6.5
+                if temperature <= 1e-3:
+                    c_idx = torch.argmax(cand_logits)
+                else:
+                    scaled = cand_logits / temperature
+                    if top_k > 0:
+                        v, _ = torch.topk(scaled, min(top_k, UNIT_VOCAB_SIZE + 1))
+                        scaled.masked_fill_(scaled < v[-1], float("-inf"))
+                    c_idx = torch.multinomial(F.softmax(scaled, dim=-1), num_samples=1).squeeze(0)
+                gpu_choices.append(c_idx)
+                tok_t = torch.where(c_idx == UNIT_VOCAB_SIZE, self.eos_token_id, c_idx + u_start).view(1, 1)
+                step_out = self.model(
+                    inputs_embeds=embed_fn(tok_t).to(dtype=dtype),
+                    past_key_values=session.kv_cache,
+                    use_cache=True,
+                    logits_to_keep=1,
+                    return_dict=True,
+                )
+                logits = step_out.logits[0, -1, :].float()
+
+            choices_cpu = torch.stack(gpu_choices).tolist()
+            steps_done += batch_n
+            for ci in choices_cpu:
+                if ci == UNIT_VOCAB_SIZE:
+                    session.finished = True
+                    break
+                buf_units.append(ci)
+                session.recent_unit_ids.append(ci + u_start)
+
+            if session.finished or steps_done >= max_steps:
+                yield buf_units, True
+                return
+            if len(buf_units) >= subchunk_size:
+                yield buf_units, False
+                buf_units = []
+
+        yield buf_units, True

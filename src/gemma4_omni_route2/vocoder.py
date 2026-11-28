@@ -462,8 +462,8 @@ class Cosy2StreamingVocoder:
 
         if not finalize:
             # First packet (offset == 0): 17 + 3 = 20 units -> 0.52s net playable audio;
-            # subsequent packets: 17 + 3 = 20 units -> 0.80s seamless audio per pass (strictly faster than playback!).
-            need_units = max(min_chunk_units, 17)
+            # subsequent packets: 10 + 3 = 13 units -> fires immediately on every Read=3 cycle (0.40s) or tail subchunk!
+            need_units = max(min_chunk_units, 17) if offset == 0 else 10
             if avail < need_units + self.flow.pre_lookahead_len:
                 return np.zeros(0, dtype=np.float32)
         else:

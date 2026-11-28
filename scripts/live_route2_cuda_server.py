@@ -209,7 +209,8 @@ class Route2OmniEngine:
             torch.set_float32_matmul_precision("high")
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
-            torch.backends.cudnn.benchmark = True
+            # MUST stay False for dynamic-length streaming HiFT Conv1d (True stalls 2.5s benchmarking every new mel_len!)
+            torch.backends.cudnn.benchmark = False
         self.dtype = torch.bfloat16 if self.device in ("cuda", "mps") else torch.float32
         print(f"🚀 [1/3] Loading Stage-1 Thinker ({base_model} + {stage1_adapter}) on {self.device}...")
 
@@ -474,19 +475,25 @@ class Route2OmniEngine:
                             return
 
                         is_end = (next_id == self.turn_end_id or next_id == self.tokenizer.eos_token_id)
+                        if is_end:
+                            for sub_u, sub_fin in self.talker.iter_turn_end_chunks(
+                                pred_h, talker_sess, temperature=0.55, subchunk_size=12
+                            ):
+                                if abort_flag is not None and abort_flag.is_set():
+                                    break
+                                unit_q.put((sub_u, sub_fin))
+                            break
+
                         u_chunk = self.talker.step_gemma_token(
                             self.tokenizer,
                             next_id,
                             pred_h,
                             talker_sess,
-                            is_turn_end=is_end,
+                            is_turn_end=False,
                             temperature=0.55,
                         )
-                        if u_chunk or is_end:
-                            unit_q.put((u_chunk, is_end))
-
-                        if is_end:
-                            break
+                        if u_chunk:
+                            unit_q.put((u_chunk, False))
 
                         gen_ids.append(next_id)
                         if next_id == self.tc_end_id:
