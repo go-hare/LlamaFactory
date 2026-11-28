@@ -232,7 +232,8 @@ class Route2OmniEngine:
 
         voc_dev = "cuda" if self.device == "cuda" else "cpu"
         print(f"🚀 [3/3] Loading Stage-3 CosyVoice2 24kHz Streaming Vocoder on {voc_dev}...")
-        self.vocoder = Cosy2StreamingVocoder(device=voc_dev, prompt_wav_path=prompt_wav, use_zero_shot_prompt=True)
+        # Use official LLaMA-Omni2 zero-prompt x-vector streaming mode (5.6x faster first-packet ODE!)
+        self.vocoder = Cosy2StreamingVocoder(device=voc_dev, prompt_wav_path=prompt_wav, use_zero_shot_prompt=False)
 
         self.turn_end_id = self.enc("<turn|>")[0]
         self.newline_id = self.enc("\n")[0]
@@ -245,6 +246,13 @@ class Route2OmniEngine:
 
     def enc(self, s: str) -> List[int]:
         return self.tokenizer.encode(s, add_special_tokens=False)
+
+    def _crop_cache(self, target_len: int) -> None:
+        if hasattr(self.cache, "crop") and hasattr(self.cache, "get_seq_length"):
+            remove_n = int(self.cache.get_seq_length()) - int(target_len)
+            if remove_n > 0:
+                self.cache.crop(-remove_n)
+        self.seq_len = target_len
 
     def _warmup(self) -> None:
         print("🔥 Warming up Thinker + Talker + Vocoder CUDA kernels...")
@@ -264,21 +272,22 @@ class Route2OmniEngine:
             sys_ids = [self.tokenizer.bos_token_id] + self.enc(self.sys_prompt)
             with torch.inference_mode():
                 inp = torch.tensor([sys_ids], dtype=torch.long, device=self.device)
-                out = self.thinker(input_ids=inp, past_key_values=self.cache, use_cache=True)
+                out = self.thinker(input_ids=inp, past_key_values=self.cache, use_cache=True, logits_to_keep=1)
                 self.cache = out.past_key_values
             self.seq_len = len(sys_ids)
 
     @torch.inference_mode()
-    def prefill_audio_tick(self, wav_048s: np.ndarray) -> Tuple[str, float]:
+    def prefill_audio_tick(self, wav_048s: np.ndarray, rollback_on_ignore: bool = False) -> Tuple[str, float]:
         """Fast (~11ms on A100) single-chunk audio state check (<unused1> listen, <unused5> ignore, <unused6> barge-in)."""
         with self.lock:
             if self.seq_len > 2800:
                 self.reset_context()
+            prev_seq_len = self.seq_len
             t0 = time.perf_counter()
             rms = float(np.sqrt(np.mean(wav_048s**2) + 1e-12))
             wav_use = wav_048s.astype(np.float32)
-            if rms >= 0.016:
-                gain = min(3.5, 0.085 / rms)
+            if rms >= 0.018:
+                gain = min(3.2, 0.085 / rms)
                 wav_use = np.clip(wav_use * gain, -0.96, 0.96)
 
             feat = self.fe([wav_use], sampling_rate=SR_IN, return_tensors="pt")
@@ -301,11 +310,18 @@ class Route2OmniEngine:
                 input_features_mask=feat["input_features_mask"].to(self.device),
                 past_key_values=self.cache,
                 use_cache=True,
+                logits_to_keep=1,
             )
             self.cache = out.past_key_values
             self.seq_len += len(chunk_ids)
 
             first_id = int(out.logits[0, -1].argmax().item())
+            # Roll back ambient noise / echo frames (<unused5>) so idle KV cache stays 100% pure!
+            if rollback_on_ignore and first_id not in (7, 12):  # 7=<unused1>, 12=<unused6>
+                self._crop_cache(prev_seq_len)
+                raw_state = self.tokenizer.decode([first_id], skip_special_tokens=False)
+                return raw_state, (time.perf_counter() - t0) * 1000.0
+
             gen_ids = [first_id]
             # If <unused6> barge-in, check next 1..3 tokens in case of <unused6><unused1> or <unused6><unused7>c1
             cur_id = first_id
@@ -314,7 +330,10 @@ class Route2OmniEngine:
                     s_inp = torch.tensor([[cur_id]], dtype=torch.long, device=self.device)
                     s_pos = torch.tensor([[self.seq_len]], dtype=torch.long, device=self.device)
                     s_attn = torch.ones((1, self.seq_len + 1), dtype=torch.long, device=self.device)
-                    s_out = self.thinker(input_ids=s_inp, position_ids=s_pos, attention_mask=s_attn, past_key_values=self.cache, use_cache=True)
+                    s_out = self.thinker(
+                        input_ids=s_inp, position_ids=s_pos, attention_mask=s_attn,
+                        past_key_values=self.cache, use_cache=True, logits_to_keep=1,
+                    )
                     self.cache = s_out.past_key_values
                     self.seq_len += 1
                     cur_id = int(s_out.logits[0, -1].argmax().item())
@@ -328,7 +347,10 @@ class Route2OmniEngine:
             t_inp = torch.tensor([tail], dtype=torch.long, device=self.device)
             t_pos = torch.arange(self.seq_len, self.seq_len + len(tail), dtype=torch.long, device=self.device).unsqueeze(0)
             t_attn = torch.ones((1, self.seq_len + len(tail)), dtype=torch.long, device=self.device)
-            t_out = self.thinker(input_ids=t_inp, position_ids=t_pos, attention_mask=t_attn, past_key_values=self.cache, use_cache=True)
+            t_out = self.thinker(
+                input_ids=t_inp, position_ids=t_pos, attention_mask=t_attn,
+                past_key_values=self.cache, use_cache=True, logits_to_keep=1,
+            )
             self.cache = t_out.past_key_values
             self.seq_len += len(tail)
 
@@ -366,6 +388,7 @@ class Route2OmniEngine:
                 past_key_values=self.cache,
                 use_cache=True,
                 output_hidden_states=True,
+                logits_to_keep=1,
                 return_dict=True,
             )
             self.cache = out.past_key_values
@@ -382,12 +405,15 @@ class Route2OmniEngine:
             next_id = int(out.logits[0, -1].argmax().item())
 
             # Short-circuit if Thinker decides not to speak (<unused1>, <unused4>, <unused5>)
-            if next_id in (7, 11):  # <unused1>, <unused5>
+            if next_id in (7, 10, 11):  # <unused1>, <unused4>, <unused5>
                 tail = [next_id, self.turn_end_id, self.newline_id]
                 t_inp = torch.tensor([tail], dtype=torch.long, device=self.device)
                 t_pos = torch.arange(self.seq_len, self.seq_len + len(tail), dtype=torch.long, device=self.device).unsqueeze(0)
                 t_attn = torch.ones((1, self.seq_len + len(tail)), dtype=torch.long, device=self.device)
-                t_out = self.thinker(input_ids=t_inp, position_ids=t_pos, attention_mask=t_attn, past_key_values=self.cache, use_cache=True)
+                t_out = self.thinker(
+                    input_ids=t_inp, position_ids=t_pos, attention_mask=t_attn,
+                    past_key_values=self.cache, use_cache=True, logits_to_keep=1,
+                )
                 self.cache = t_out.past_key_values
                 self.seq_len += len(tail)
                 yield ("state_only", self.tokenizer.decode([next_id], skip_special_tokens=False))
@@ -402,7 +428,10 @@ class Route2OmniEngine:
                     c_inp = torch.tensor([close_ids], dtype=torch.long, device=self.device)
                     c_pos = torch.arange(self.seq_len, self.seq_len + 2, dtype=torch.long, device=self.device).unsqueeze(0)
                     c_attn = torch.ones((1, self.seq_len + 2), dtype=torch.long, device=self.device)
-                    c_out = self.thinker(input_ids=c_inp, position_ids=c_pos, attention_mask=c_attn, past_key_values=self.cache, use_cache=True)
+                    c_out = self.thinker(
+                        input_ids=c_inp, position_ids=c_pos, attention_mask=c_attn,
+                        past_key_values=self.cache, use_cache=True, logits_to_keep=1,
+                    )
                     self.cache = c_out.past_key_values
                     self.seq_len += 2
                     return
@@ -414,10 +443,10 @@ class Route2OmniEngine:
                     pred_h,
                     talker_sess,
                     is_turn_end=is_end,
-                    temperature=0.0,
+                    temperature=0.55,
                 )
                 if u_chunk or is_end:
-                    pcm_f32 = self.vocoder.push_units(u_chunk, voc_sess, finalize=is_end, min_chunk_units=6)
+                    pcm_f32 = self.vocoder.push_units(u_chunk, voc_sess, finalize=is_end, min_chunk_units=5)
                     if len(pcm_f32) > 0:
                         if first_audio_ms is None:
                             first_audio_ms = (time.perf_counter() - t_start) * 1000.0
@@ -445,6 +474,7 @@ class Route2OmniEngine:
                     past_key_values=self.cache,
                     use_cache=True,
                     output_hidden_states=True,
+                    logits_to_keep=1,
                     return_dict=True,
                 )
                 self.cache = s_out.past_key_values
@@ -457,7 +487,10 @@ class Route2OmniEngine:
             e_inp = torch.tensor([end_tail], dtype=torch.long, device=self.device)
             e_pos = torch.arange(self.seq_len, self.seq_len + 2, dtype=torch.long, device=self.device).unsqueeze(0)
             e_attn = torch.ones((1, self.seq_len + 2), dtype=torch.long, device=self.device)
-            e_out = self.thinker(input_ids=e_inp, position_ids=e_pos, attention_mask=e_attn, past_key_values=self.cache, use_cache=True)
+            e_out = self.thinker(
+                input_ids=e_inp, position_ids=e_pos, attention_mask=e_attn,
+                past_key_values=self.cache, use_cache=True, logits_to_keep=1,
+            )
             self.cache = e_out.past_key_values
             self.seq_len += 2
 
@@ -500,7 +533,8 @@ HTML_PAGE = """<!DOCTYPE html>
     <h1>⚡ Gemma-4-E2B Route 2 (II-A) 谷歌三段式原生流式全双工语音引擎</h1>
     <div class="sub">Gemma-4-E2B Thinker (全双工槽位 + 零ASR工具) ──► Hidden States Gate-Fusion Talker (25Hz) ──► CosyVoice2 GPU Vocoder (24kHz 直出)</div>
     <div class="row">
-      <button id="micBtn" onclick="toggleMic()">🎙️ 开启麦克风全双工对话</button>
+      <button id="micBtn" onclick="toggleMic()">🎙️ 开启麦克风对话</button>
+      <button id="modeBtn" class="sec" onclick="toggleDuplexMode()">🔊 外放防回声模式 (默认)</button>
       <button class="sec" onclick="resetSession()">🔄 重置上下文</button>
       <span id="stateBadge" class="badge">状态: 空闲待命</span>
       <span id="ttfaLabel" class="ttfa">首包音频延迟 (TTFA): -- ms</span>
@@ -510,7 +544,7 @@ HTML_PAGE = """<!DOCTYPE html>
       <span style="font-size:12px;color:#94a3b8;">一键免麦测试:</span>
       <button class="sec" onclick="sendTextSim('你好呀！你叫什么名字？')">👋 测试问候 (挂9工具不误触发)</button>
       <button class="sec" onclick="sendTextSim('帮我查一下明天北京的天气怎么样')">🌤️ 测试异步查天气</button>
-      <button class="sec" onclick="bargeInSim()">🛑 测试 0ms 打断清播报</button>
+      <button class="sec" onclick="bargeInSim()">🛑 立即打断清播报</button>
     </div>
   </div>
   <div class="card">
@@ -523,10 +557,11 @@ let audioCtx = null;
 let micStream = null;
 let scriptNode = null;
 let micActive = false;
+let duplexMode = 'speaker';
 let nextPlayTime = 0;
 let activeSources = [];
-let playbackEndTimer = null;
 let isAiPlaying = false;
+let lastPlayEndMs = 0;
 
 function addLog(cls, text) {
   const el = document.getElementById('log');
@@ -539,7 +574,7 @@ function addLog(cls, text) {
 
 function ensureAudioCtx() {
   if (!audioCtx) {
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   }
   if (audioCtx.state === 'suspended') audioCtx.resume();
 }
@@ -550,6 +585,7 @@ function stopAllPlayback() {
   }
   activeSources = [];
   nextPlayTime = 0;
+  if (isAiPlaying) lastPlayEndMs = performance.now();
   isAiPlaying = false;
 }
 
@@ -558,7 +594,9 @@ function playPcm24kBase64(b64) {
   const bin = atob(b64);
   const len = bin.length / 2;
   const f32 = new Float32Array(len);
-  const view = new DataView(new Uint8Array([...bin].map(c => c.charCodeAt(0))).buffer);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const view = new DataView(bytes.buffer);
   for (let i = 0; i < len; i++) {
     f32[i] = view.getInt16(i * 2, true) / 32768.0;
   }
@@ -576,14 +614,20 @@ function playPcm24kBase64(b64) {
   activeSources.push(src);
   src.onended = () => {
     activeSources = activeSources.filter(x => x !== src);
-    if (activeSources.length === 0) isAiPlaying = false;
+    if (activeSources.length === 0) {
+      isAiPlaying = false;
+      lastPlayEndMs = performance.now();
+    }
   };
 }
 
 function connectWs() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(proto + '//' + location.host + '/ws');
-  ws.onopen = () => addLog('sys', '✅ 已连接 GPU 三段式流式语音服务器');
+  ws.onopen = () => {
+    addLog('sys', '✅ 已连接 GPU 三段式流式语音服务器');
+    ws.send(JSON.stringify({ type: 'set_mode', mode: duplexMode }));
+  };
   ws.onmessage = (ev) => {
     const msg = JSON.parse(ev.data);
     if (msg.type === 'state') {
@@ -608,6 +652,21 @@ function connectWs() {
 }
 connectWs();
 
+function toggleDuplexMode() {
+  duplexMode = (duplexMode === 'speaker') ? 'headset' : 'speaker';
+  const btn = document.getElementById('modeBtn');
+  if (duplexMode === 'speaker') {
+    btn.textContent = '🔊 外放防回声模式 (默认)';
+    btn.style.background = '#334155';
+  } else {
+    btn.textContent = '🎧 耳机全双工自由打断';
+    btn.style.background = '#0d9488';
+  }
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify({ type: 'set_mode', mode: duplexMode }));
+  }
+}
+
 async function toggleMic() {
   ensureAudioCtx();
   const btn = document.getElementById('micBtn');
@@ -615,22 +674,21 @@ async function toggleMic() {
     micActive = false;
     if (scriptNode) scriptNode.disconnect();
     if (micStream) micStream.getTracks().forEach(t => t.stop());
-    btn.textContent = '🎙️ 开启麦克风全双工对话';
+    btn.textContent = '🎙️ 开启麦克风对话';
     btn.className = '';
     return;
   }
   try {
     micStream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 }
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false, channelCount: 1 }
     });
   } catch (err) {
     addLog('sys', '❌ 麦克风权限获取失败: ' + err.message + ' (请使用 HTTPS cloudflared 链接在 Chrome 打开)');
     return;
   }
-  const micCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-  const src = micCtx.createMediaStreamSource(micStream);
-  scriptNode = micCtx.createScriptProcessor(4096, 1, 1);
-  const muteGain = micCtx.createGain();
+  const src = audioCtx.createMediaStreamSource(micStream);
+  scriptNode = audioCtx.createScriptProcessor(4096, 1, 1);
+  const muteGain = audioCtx.createGain();
   muteGain.gain.value = 0;
   let ring = new Float32Array(0);
 
@@ -638,8 +696,8 @@ async function toggleMic() {
     if (!micActive || !ws || ws.readyState !== 1) return;
     const rawInp = e.inputBuffer.getChannelData(0);
     let inp = rawInp;
-    if (micCtx.sampleRate !== 16000) {
-      const ratio = micCtx.sampleRate / 16000;
+    if (audioCtx.sampleRate !== 16000) {
+      const ratio = audioCtx.sampleRate / 16000;
       const newLen = Math.round(rawInp.length / ratio);
       inp = new Float32Array(newLen);
       for (let i = 0; i < newLen; i++) {
@@ -663,6 +721,7 @@ async function toggleMic() {
       const rms = Math.sqrt(sum / frame.length);
       document.getElementById('meterBar').style.width = Math.min(100, rms * 450) + '%';
 
+      const inTailCooldown = (performance.now() - lastPlayEndMs) < 700;
       const i16 = new Int16Array(7680);
       for (let i = 0; i < 7680; i++) {
         const s = Math.max(-1, Math.min(1, frame[i]));
@@ -671,16 +730,21 @@ async function toggleMic() {
       const u8 = new Uint8Array(i16.buffer);
       let bin = '';
       for (let i = 0; i < u8.length; i++) bin += String.fromCharCode(u8[i]);
-      ws.send(JSON.stringify({ type: 'mic_frame', pcm16_b64: btoa(bin), rms: rms, ai_playing: isAiPlaying }));
+      ws.send(JSON.stringify({
+        type: 'mic_frame',
+        pcm16_b64: btoa(bin),
+        rms: rms,
+        ai_playing: (isAiPlaying || inTailCooldown)
+      }));
     }
   };
   src.connect(scriptNode);
   scriptNode.connect(muteGain);
-  muteGain.connect(micCtx.destination);
+  muteGain.connect(audioCtx.destination);
   micActive = true;
   btn.textContent = '⏹️ 关闭麦克风';
   btn.className = 'stop';
-  addLog('sys', '🎙️ 麦克风全双工流已启动 (0.48s 物理帧 @ 16kHz -> 24kHz GPU 声码器直出)');
+  addLog('sys', '🎙️ 麦克风已启动 (默认「🔊外放防回声」不会自激；若戴耳机可点上方按钮切换「🎧耳机全双工自由打断」)');
 }
 
 function sendTextSim(txt) {
@@ -704,6 +768,18 @@ function resetSession() {
 """
 
 
+def is_human_speech_frame(wav_7680: np.ndarray, rms: float, noise_floor: float, already_speaking: bool) -> bool:
+    """0.04ms spectral + adaptive SNR check blocking stationary fan noise (<0.48 vband) and desk thumps (<0.05 vband)."""
+    min_rms = max(0.015, noise_floor * 1.7) if already_speaking else max(0.022, noise_floor * 2.3)
+    if rms < min_rms:
+        return False
+    spec = np.abs(np.fft.rfft(wav_7680)) ** 2
+    tot = float(np.sum(spec) + 1e-12)
+    # 7680 samples @ 16kHz -> bin spacing = 2.0833 Hz; 150..3800 Hz = bins 72..1824
+    vband_ratio = float(np.sum(spec[72:1825])) / tot
+    return vband_ratio >= (0.50 if already_speaking else 0.56)
+
+
 def create_app(engine: Route2OmniEngine) -> FastAPI:
     app = FastAPI()
 
@@ -716,9 +792,14 @@ def create_app(engine: Route2OmniEngine) -> FastAPI:
         await ws.accept()
         loop = asyncio.get_running_loop()
 
-        user_speaking = False
+        duplex_mode = "speaker"  # "speaker" (echo-safe default) or "headset" (free full-duplex barge-in)
+        valid_speech_frames = 0
         silence_frames = 0
+        barge_frames = 0
+        noise_floor = 0.008
         is_generating = False
+        server_play_until = 0.0
+        cooldown_until = 0.0
         abort_event = threading.Event()
         active_tool_tasks: Dict[str, asyncio.Task] = {}
 
@@ -727,7 +808,7 @@ def create_app(engine: Route2OmniEngine) -> FastAPI:
                 await ws.send_text(json.dumps(payload, ensure_ascii=False))
 
         async def run_streaming_turn(trigger_mode: str, tool_obs: Optional[str] = None, text_query: Optional[str] = None) -> None:
-            nonlocal is_generating
+            nonlocal is_generating, server_play_until, cooldown_until
             is_generating = True
             abort_event.clear()
             q: asyncio.Queue = asyncio.Queue()
@@ -755,6 +836,10 @@ def create_app(engine: Route2OmniEngine) -> FastAPI:
                     await send_json({"type": "state", "state": ev[1], "ms": 0.0})
                 elif kind == "audio_pcm":
                     pcm_bytes, ttfa_ms = ev[1], ev[2]
+                    chunk_dur = (len(pcm_bytes) / 2.0) / float(SR_OUT)
+                    now_m = time.monotonic()
+                    server_play_until = max(now_m, server_play_until) + chunk_dur
+                    cooldown_until = server_play_until + 0.75
                     await send_json({
                         "type": "audio_chunk",
                         "pcm_b64": base64.b64encode(pcm_bytes).decode("ascii"),
@@ -769,7 +854,6 @@ def create_app(engine: Route2OmniEngine) -> FastAPI:
                         if abort_event.is_set():
                             return
                         obs_json = json.dumps(res, ensure_ascii=False)
-                        # Wait briefly if spoken acknowledgement is still streaming
                         while is_generating and not abort_event.is_set():
                             await asyncio.sleep(0.05)
                         if not abort_event.is_set():
@@ -792,14 +876,22 @@ def create_app(engine: Route2OmniEngine) -> FastAPI:
                 data = json.loads(raw_msg)
                 mtype = data.get("type")
 
-                if mtype == "reset":
+                if mtype == "set_mode":
+                    duplex_mode = "headset" if data.get("mode") == "headset" else "speaker"
+                    label = "🎧 耳机全双工自由打断模式" if duplex_mode == "headset" else "🔊 外放防回声安全模式"
+                    await send_json({"type": "info", "text": f"已切换至: {label}"})
+
+                elif mtype == "reset":
                     abort_event.set()
                     for t in active_tool_tasks.values():
                         t.cancel()
                     active_tool_tasks.clear()
                     await loop.run_in_executor(None, engine.reset_context)
-                    user_speaking = False
+                    valid_speech_frames = 0
                     silence_frames = 0
+                    barge_frames = 0
+                    server_play_until = 0.0
+                    cooldown_until = 0.0
                     await send_json({"type": "info", "text": "🔄 会话 KV Cache 与声码器状态已重置"})
 
                 elif mtype == "barge_sim":
@@ -807,13 +899,18 @@ def create_app(engine: Route2OmniEngine) -> FastAPI:
                     for t in active_tool_tasks.values():
                         t.cancel()
                     active_tool_tasks.clear()
+                    valid_speech_frames = 0
+                    silence_frames = 0
+                    server_play_until = 0.0
+                    cooldown_until = time.monotonic() + 0.35
                     await send_json({"type": "stop_audio"})
                     await send_json({"type": "state", "state": "<unused6>", "ms": 0.5})
 
                 elif mtype == "text_sim":
                     abort_event.set()
+                    valid_speech_frames = 0
+                    silence_frames = 0
                     await asyncio.sleep(0.02)
-                    # Synthesize true 16kHz spoken frames so native audio Thinker runs in 100% authentic audio mode!
                     sim_text = str(data["text"])
 
                     async def _run_audio_sim(q_txt: str) -> None:
@@ -835,7 +932,6 @@ def create_app(engine: Route2OmniEngine) -> FastAPI:
                         for ofr in resampler.resample(None):
                             arrs.append(ofr.to_ndarray()[0])
                         wav_sim = np.concatenate(arrs).astype(np.float32) if arrs else np.zeros(CHUNK_SAMPLES, dtype=np.float32)
-                        # Trim edge-tts leading/trailing silence so only active speech frames (>=0.012 RMS) enter prefill_audio_tick
                         win = 400
                         nf = len(wav_sim) // win
                         if nf > 2:
@@ -849,7 +945,7 @@ def create_app(engine: Route2OmniEngine) -> FastAPI:
                                 break
                             if len(seg) < CHUNK_SAMPLES:
                                 seg = np.pad(seg, (0, CHUNK_SAMPLES - len(seg)))
-                            st, ms = await loop.run_in_executor(None, engine.prefill_audio_tick, seg)
+                            st, ms = await loop.run_in_executor(None, engine.prefill_audio_tick, seg, False)
                             await send_json({"type": "state", "state": st, "ms": ms})
                         await run_streaming_turn("silence")
 
@@ -860,50 +956,83 @@ def create_app(engine: Route2OmniEngine) -> FastAPI:
                     wav = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
                     rms = float(data.get("rms", 0.0))
                     ai_playing = bool(data.get("ai_playing", False))
+                    now_m = time.monotonic()
 
-                    # Case 1: AI is currently speaking -> check for <unused5> noise/backchannel vs <unused6> real barge-in!
-                    if is_generating or ai_playing:
-                        if rms >= 0.022:
+                    if ai_playing:
+                        cooldown_until = max(cooldown_until, now_m + 0.70)
+
+                    in_playback_window = is_generating or ai_playing or (now_m < server_play_until) or (now_m < cooldown_until)
+
+                    # Case 1: AI is speaking or within post-playback room-reverb cooldown
+                    if in_playback_window:
+                        valid_speech_frames = 0
+                        silence_frames = 0
+                        if duplex_mode == "speaker":
+                            # Echo-safe speakerphone mode: prevent speaker bleed from self-looping
+                            continue
+
+                        # Headset full-duplex mode: verify real human barge-in on Thinker without speaker bleed
+                        if rms >= 0.028:
+                            barge_frames += 1
                             if not is_generating:
-                                st, ms = await loop.run_in_executor(None, engine.prefill_audio_tick, wav)
-                                if "<unused6>" in st:
-                                    for t in active_tool_tasks.values():
-                                        t.cancel()
-                                    active_tool_tasks.clear()
-                                    await send_json({"type": "stop_audio"})
-                                    await send_json({"type": "state", "state": st, "ms": ms})
-                                    user_speaking = True
-                                    silence_frames = 0
-                                else:
-                                    await send_json({"type": "state", "state": "<unused5>", "ms": ms})
-                            elif rms >= 0.038:
-                                # Mid-generation strong near-field voice -> trigger abort & verify on Thinker
-                                abort_event.set()
-                                while is_generating:
-                                    await asyncio.sleep(0.005)
-                                st, ms = await loop.run_in_executor(None, engine.prefill_audio_tick, wav)
+                                st, ms = await loop.run_in_executor(None, engine.prefill_audio_tick, wav, True)
                                 if "<unused6>" in st or "<unused1>" in st:
                                     for t in active_tool_tasks.values():
                                         t.cancel()
                                     active_tool_tasks.clear()
+                                    server_play_until = 0.0
+                                    cooldown_until = 0.0
+                                    await send_json({"type": "stop_audio"})
+                                    await send_json({"type": "state", "state": st, "ms": ms})
+                                    valid_speech_frames = 1
+                                    silence_frames = 0
+                                    barge_frames = 0
+                            elif barge_frames >= 2:
+                                abort_event.set()
+                                while is_generating:
+                                    await asyncio.sleep(0.005)
+                                st, ms = await loop.run_in_executor(None, engine.prefill_audio_tick, wav, True)
+                                if "<unused6>" in st or "<unused1>" in st:
+                                    for t in active_tool_tasks.values():
+                                        t.cancel()
+                                    active_tool_tasks.clear()
+                                    server_play_until = 0.0
+                                    cooldown_until = 0.0
                                     await send_json({"type": "stop_audio"})
                                     await send_json({"type": "state", "state": "<unused6><unused1>", "ms": ms})
-                                    user_speaking = True
+                                    valid_speech_frames = 1
                                     silence_frames = 0
+                                barge_frames = 0
+                        else:
+                            barge_frames = 0
                         continue
 
-                    # Case 2: Normal listening / endpointing
-                    if rms >= 0.012:
-                        user_speaking = True
-                        silence_frames = 0
-                        st, ms = await loop.run_in_executor(None, engine.prefill_audio_tick, wav)
+                    # Case 2: Normal listening & state-verified endpointing
+                    barge_frames = 0
+                    if is_human_speech_frame(wav, rms, noise_floor, already_speaking=(valid_speech_frames > 0)):
+                        st, ms = await loop.run_in_executor(
+                            None, engine.prefill_audio_tick, wav, (valid_speech_frames == 0)
+                        )
                         await send_json({"type": "state", "state": st, "ms": ms})
-                    else:
-                        if user_speaking:
+                        if "<unused1>" in st or "<unused6>" in st:
+                            valid_speech_frames += 1
+                            silence_frames = 0
+                        elif valid_speech_frames > 0:
                             silence_frames += 1
                             if silence_frames >= 1:
-                                user_speaking = False
+                                valid_speech_frames = 0
                                 silence_frames = 0
+                                cooldown_until = now_m + 0.50
+                                asyncio.create_task(run_streaming_turn("silence"))
+                    else:
+                        if valid_speech_frames == 0 and rms < 0.035:
+                            noise_floor = float(min(0.025, 0.90 * noise_floor + 0.10 * rms))
+                        if valid_speech_frames >= 1:
+                            silence_frames += 1
+                            if silence_frames >= 1:
+                                valid_speech_frames = 0
+                                silence_frames = 0
+                                cooldown_until = now_m + 0.50
                                 asyncio.create_task(run_streaming_turn("silence"))
         except WebSocketDisconnect:
             abort_event.set()

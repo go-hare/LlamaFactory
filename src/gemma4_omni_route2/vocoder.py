@@ -283,11 +283,13 @@ class Cosy2StreamingVocoder:
             sess_options=opt,
             providers=["CPUExecutionProvider"],
         )
-        # Run one-time prompt unit extraction strictly on CPU so onnxruntime never hijacks CUDA VRAM arena!
-        speech_tok_cpu = SpeechTokenizerV2(
-            os.path.join(model_dir, "speech_tokenizer_v2.onnx"),
-            prefer_cuda=False,
-        )
+        speech_tok_cpu = None
+        if use_zero_shot_prompt:
+            # Run one-time prompt unit extraction strictly on CPU so onnxruntime never hijacks CUDA VRAM arena!
+            speech_tok_cpu = SpeechTokenizerV2(
+                os.path.join(model_dir, "speech_tokenizer_v2.onnx"),
+                prefer_cuda=False,
+            )
 
         self.flow, self.hift = _build_cosy2_flow_and_hift()
         self.flow.load_state_dict(
@@ -460,8 +462,10 @@ class Cosy2StreamingVocoder:
             return np.zeros(0, dtype=np.float32)
 
         if not finalize:
-            # Need at least min_chunk_units + pre_lookahead_len so mel > mel_cache_len (8 frames = 4 tokens)
-            if avail < max(min_chunk_units, 5) + self.flow.pre_lookahead_len:
+            # First packet (offset == 0) triggers at 5 units + lookahead (8 units) for minimal TTFA;
+            # subsequent chunks gather >= 8 units for ultra-smooth overlap-add continuity.
+            need_units = max(min_chunk_units, 5) if offset == 0 else max(min_chunk_units, 8)
+            if avail < need_units + self.flow.pre_lookahead_len:
                 return np.zeros(0, dtype=np.float32)
         else:
             if avail <= 0:

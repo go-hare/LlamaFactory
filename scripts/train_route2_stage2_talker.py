@@ -398,7 +398,7 @@ def main() -> None:
             for idx in range(0, len(tids), talker.read_len):
                 fin = (idx + talker.read_len >= len(tids))
                 fused, _ = talker.fuse_representations(th[idx : idx + talker.read_len], tids[idx : idx + talker.read_len])
-                pred_units.extend(talker._decode_unit_chunk(fused, sess, is_finished=fin, temperature=0.0))
+                pred_units.extend(talker._decode_unit_chunk(fused, sess, is_finished=fin, temperature=0.8))
             wav = voc.synthesize_full(pred_units)
             wav_p = out_dir / f"val_preview_{pi}.wav"
             sf.write(str(wav_p), wav, 24000)

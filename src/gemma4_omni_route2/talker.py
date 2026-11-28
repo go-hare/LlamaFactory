@@ -379,8 +379,8 @@ class Gemma4SpeechGenerator(nn.Module):
         new_embeds: torch.Tensor,
         session: TalkerStreamSession,
         is_finished: bool,
-        temperature: float = 0.0,
-        top_k: int = 25,
+        temperature: float = 0.55,
+        top_k: int = 15,
     ) -> list[int]:
         """Incremental KV-cached unit generation (prefills ONLY new_embeds, decodes <=W units in ~4ms on A100)."""
         device = new_embeds.device
@@ -395,6 +395,7 @@ class Gemma4SpeechGenerator(nn.Module):
             inputs_embeds=new_embeds.unsqueeze(0),
             past_key_values=session.kv_cache,
             use_cache=True,
+            logits_to_keep=1,
             return_dict=True,
         )
         logits = out.logits[0, -1, :].float()
@@ -402,8 +403,8 @@ class Gemma4SpeechGenerator(nn.Module):
         if not is_finished:
             max_steps = self.write_len
         else:
-            est_cap = max(24, session.spoken_char_count * 7 - len(session.recent_unit_ids) + 18)
-            max_steps = min(180, est_cap) if session.spoken_char_count > 0 else 180
+            est_cap = max(24, session.spoken_char_count * 6 - len(session.recent_unit_ids) + 14)
+            max_steps = min(160, est_cap) if session.spoken_char_count > 0 else 160
         emitted_units: list[int] = []
         u_start = self.unit_offset
         u_end = self.unit_offset + UNIT_VOCAB_SIZE  # 158227
@@ -415,10 +416,12 @@ class Gemma4SpeechGenerator(nn.Module):
             if is_finished:
                 allowed_logits[self.eos_token_id] = logits[self.eos_token_id]
 
-            # Guard ONLY against pathological >8-frame stuck loops (preserve normal 2~5 frame vowel nuclei!)
+            # Guard against both 1-token stuck loops and 2-token breath/silence oscillations
             if len(session.recent_unit_ids) >= 8 and len(set(session.recent_unit_ids[-8:])) == 1:
-                stuck_id = session.recent_unit_ids[-1]
-                allowed_logits[stuck_id] -= 8.0
+                allowed_logits[session.recent_unit_ids[-1]] -= 8.0
+            elif len(session.recent_unit_ids) >= 10 and len(set(session.recent_unit_ids[-10:])) <= 2:
+                for stuck_id in set(session.recent_unit_ids[-10:]):
+                    allowed_logits[stuck_id] -= 6.0
 
             if temperature <= 1e-3:
                 next_id = int(torch.argmax(allowed_logits).item())
@@ -446,6 +449,7 @@ class Gemma4SpeechGenerator(nn.Module):
                     inputs_embeds=embed_fn(next_t).to(dtype=dtype),
                     past_key_values=session.kv_cache,
                     use_cache=True,
+                    logits_to_keep=1,
                     return_dict=True,
                 )
                 logits = step_out.logits[0, -1, :].float()
@@ -455,6 +459,7 @@ class Gemma4SpeechGenerator(nn.Module):
                     inputs_embeds=embed_fn(next_t).to(dtype=dtype),
                     past_key_values=session.kv_cache,
                     use_cache=True,
+                    logits_to_keep=1,
                     return_dict=True,
                 )
 
@@ -468,7 +473,7 @@ class Gemma4SpeechGenerator(nn.Module):
         gemma_pred_hidden: torch.Tensor,
         session: TalkerStreamSession,
         is_turn_end: bool = False,
-        temperature: float = 0.7,
+        temperature: float = 0.55,
     ) -> list[int]:
         """Feed one newly generated Gemma-4 token + its predicting hidden state [1536] in live streaming."""
         if session.finished:
