@@ -461,9 +461,8 @@ class Cosy2StreamingVocoder:
             return np.zeros(0, dtype=np.float32)
 
         if not finalize:
-            # First packet (offset == 0): 17 + 3 = 20 units -> 0.52s net playable audio;
-            # subsequent packets: 10 + 3 = 13 units -> fires immediately on every Read=3 cycle (0.40s) or tail subchunk!
-            need_units = max(min_chunk_units, 17) if offset == 0 else 10
+            # With CUDAGraph (~22ms per Read=3 cycle on A100), Chunk 0 fires on Cycle 1 (10 units) for <300ms TTFA!
+            need_units = max(min_chunk_units, 7) if offset == 0 else 14
             if avail < need_units + self.flow.pre_lookahead_len:
                 return np.zeros(0, dtype=np.float32)
         else:

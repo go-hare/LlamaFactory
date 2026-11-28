@@ -44,8 +44,10 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from gemma4_omni_route2 import (  # noqa: E402
     Cosy2StreamingVocoder,
     Gemma4SpeechGenerator,
+    StaticGraphCache,
     TalkerStreamSession,
     ensure_gemma4_duplex_special_tokens,
+    make_prefill_masks,
 )
 from llamafactory.data.tool_utils import Gemma4ToolUtils  # noqa: E402
 
@@ -241,7 +243,18 @@ class Route2OmniEngine:
         print(f"🚀 [3/3] Loading Stage-3 CosyVoice2 24kHz Streaming Vocoder on {voc_dev}...")
         # Use official LLaMA-Omni2 zero-prompt x-vector streaming mode (5.6x faster first-packet ODE!)
         self.vocoder = Cosy2StreamingVocoder(device=voc_dev, prompt_wav_path=prompt_wav, use_zero_shot_prompt=False)
+        self.infer_cuda_stream = torch.cuda.Stream() if self.device == "cuda" else None
         self.voc_cuda_stream = torch.cuda.Stream() if self.device == "cuda" else None
+
+        self.max_cache_len = 3072
+        self.sliding_window = int(self.thinker.config.text_config.sliding_window)
+        self.cache = StaticGraphCache(max_len=self.max_cache_len)
+        self._thinker_graph: Optional[torch.cuda.CUDAGraph] = None
+        self._t_inp = torch.zeros((1, 1), dtype=torch.long, device=self.device)
+        self._t_pos_1d = torch.zeros((1,), dtype=torch.long, device=self.device)
+        self._t_idx = torch.arange(self.max_cache_len, device=self.device).view(1, 1, 1, self.max_cache_len)
+        self._t_pred_h = torch.zeros((1536,), dtype=self.dtype, device=self.device)
+        self._t_next_id = torch.zeros((), dtype=torch.long, device=self.device)
 
         self.turn_end_id = self.enc("<turn|>")[0]
         self.newline_id = self.enc("\n")[0]
@@ -249,53 +262,174 @@ class Route2OmniEngine:
         tool_decl = Gemma4ToolUtils.tool_formatter(LIVE_TOOLS_SCHEMA)
         self.sys_prompt = f"<|turn>system\nYou are a real-time full-duplex voice assistant.{tool_decl}<turn|>\n"
         self.lock = threading.Lock()
+        self.seq_len = 0
         self.reset_context()
         self._warmup()
 
     def enc(self, s: str) -> List[int]:
         return self.tokenizer.encode(s, add_special_tokens=False)
 
+    def _infer_stream_ctx(self):
+        return torch.cuda.stream(self.infer_cuda_stream) if self.infer_cuda_stream is not None else torch.inference_mode()
+
     def _crop_cache(self, target_len: int) -> None:
-        if hasattr(self.cache, "crop") and hasattr(self.cache, "get_seq_length"):
-            remove_n = int(self.cache.get_seq_length()) - int(target_len)
-            if remove_n > 0:
-                self.cache.crop(-remove_n)
-        self.seq_len = target_len
+        self.cache.crop_to(target_len)
+        self.seq_len = self.cache.seq_len_int
+
+    def _prefill_thinker_unlocked(
+        self,
+        inp_ids_2d: torch.Tensor,
+        input_features: Optional[torch.Tensor] = None,
+        input_features_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        L = int(inp_ids_2d.shape[1])
+        if self.seq_len + L >= self.max_cache_len - 96:
+            self._reset_context_unlocked()
+        self.cache.graph_pos = None
+        masks, pos_2d = make_prefill_masks(self.seq_len, L, self.sliding_window, self.device)
+        m_out = self.thinker.model(
+            input_ids=inp_ids_2d,
+            position_ids=pos_2d,
+            attention_mask=masks,
+            input_features=input_features,
+            input_features_mask=input_features_mask,
+            past_key_values=self.cache,
+            use_cache=True,
+            return_dict=True,
+        )
+        self.seq_len += L
+        self.cache.seq_len_int = self.seq_len
+        last_h = m_out.last_hidden_state[:, -1:, :]
+        logits_1 = self.thinker.lm_head(last_h)
+        return last_h[0, 0, :], logits_1[0, 0, :]
+
+    def _step_thinker_1tok_unlocked(self, token_id: int) -> Tuple[torch.Tensor, int]:
+        if self._thinker_graph is not None and self.seq_len < self.max_cache_len - 2:
+            self.cache.graph_pos = self._t_pos_1d
+            self._t_inp.fill_(int(token_id))
+            self._t_pos_1d.fill_(int(self.seq_len))
+            self._thinker_graph.replay()
+            self.cache.graph_pos = None
+            self.seq_len += 1
+            self.cache.seq_len_int = self.seq_len
+            return self._t_pred_h.clone(), int(self._t_next_id.item())
+
+        self.cache.graph_pos = self._t_pos_1d
+        self._t_inp.fill_(int(token_id))
+        self._t_pos_1d.fill_(int(self.seq_len))
+        pv = self._t_pos_1d.view(1, 1, 1, 1)
+        gm_m = {
+            "full_attention": (self._t_idx <= pv),
+            "sliding_attention": (self._t_idx <= pv) & (self._t_idx > pv - self.sliding_window),
+        }
+        out_s = self.thinker.model.language_model(
+            input_ids=self._t_inp,
+            position_ids=self._t_pos_1d.unsqueeze(0),
+            attention_mask=gm_m,
+            past_key_values=self.cache,
+            use_cache=True,
+            return_dict=True,
+        )
+        self.cache.graph_pos = None
+        self.seq_len += 1
+        self.cache.seq_len_int = self.seq_len
+        last_h = out_s.last_hidden_state[:, -1:, :]
+        logits_1 = self.thinker.lm_head(last_h)
+        return last_h[0, 0, :], int(logits_1[0, 0].argmax().item())
+
+    def _init_thinker_cuda_graph(self) -> None:
+        if self.device != "cuda" or self._thinker_graph is not None:
+            return
+        try:
+            assert self.infer_cuda_stream is not None
+            self.cache.graph_pos = self._t_pos_1d
+            self._t_inp.fill_(self.turn_end_id)
+            self._t_pos_1d.fill_(self.seq_len)
+
+            def _body() -> None:
+                pv = self._t_pos_1d.view(1, 1, 1, 1)
+                gm_m = {
+                    "full_attention": (self._t_idx <= pv),
+                    "sliding_attention": (self._t_idx <= pv) & (self._t_idx > pv - self.sliding_window),
+                }
+                out_lm = self.thinker.model.language_model(
+                    input_ids=self._t_inp,
+                    position_ids=self._t_pos_1d.unsqueeze(0),
+                    attention_mask=gm_m,
+                    past_key_values=self.cache,
+                    use_cache=True,
+                    return_dict=True,
+                )
+                lh = out_lm.last_hidden_state[:, -1:, :]
+                lg = self.thinker.lm_head(lh)
+                self._t_pred_h.copy_(lh[0, 0, :])
+                self._t_next_id.copy_(lg[0, 0].argmax())
+
+            self.infer_cuda_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self.infer_cuda_stream):
+                for _ in range(3):
+                    _body()
+            torch.cuda.synchronize()
+
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, stream=self.infer_cuda_stream, capture_error_mode="thread_local"):
+                _body()
+            torch.cuda.synchronize()
+            self.cache.graph_pos = None
+            self._thinker_graph = g
+            print("   ⚡ Captured Gemma-4 35-layer single-token CUDAGraph (~3.5ms/tok)!")
+        except Exception as exc:
+            self.cache.graph_pos = None
+            self._thinker_graph = None
+            print(f"   ⚠️ Thinker CUDAGraph fallback to eager ({exc})")
 
     def _warmup(self) -> None:
-        print("🔥 Warming up Thinker + Talker + Vocoder CUDA kernels...")
+        print("🔥 Warming up & capturing CUDAGraphs for Thinker + Talker + Vocoder...")
+        if self.device == "cuda":
+            self._init_thinker_cuda_graph()
+            if self.talker.init_cuda_graph(stream=self.infer_cuda_stream):
+                print("   ⚡ Captured Talker 24-layer single-unit CUDAGraph (~0.7ms/unit)!")
         dummy_wav = (np.random.randn(CHUNK_SAMPLES).astype(np.float32) * 0.04)
         _ = self.prefill_audio_tick(dummy_wav)
-        ts = TalkerStreamSession()
-        vs = self.vocoder.init_session()
-        u = self.talker.step_gemma_token(self.tokenizer, self.enc("你好")[0], torch.zeros(1536, device=self.device, dtype=self.dtype), ts, is_turn_end=False)
-        u2 = self.talker.step_gemma_token(self.tokenizer, self.turn_end_id, torch.zeros(1536, device=self.device, dtype=self.dtype), ts, is_turn_end=True)
-        _ = self.vocoder.push_units(u + u2, vs, finalize=True)
+        with self._infer_stream_ctx(), torch.inference_mode():
+            ts = TalkerStreamSession()
+            vs = self.vocoder.init_session()
+            u = self.talker.step_gemma_token(
+                self.tokenizer, self.enc("你好")[0], torch.zeros(1536, device=self.device, dtype=self.dtype), ts, is_turn_end=False
+            )
+            u2 = self.talker.step_gemma_token(
+                self.tokenizer, self.turn_end_id, torch.zeros(1536, device=self.device, dtype=self.dtype), ts, is_turn_end=True
+            )
+            _ = self.vocoder.push_units(u + u2, vs, finalize=True)
         self.reset_context()
-        print("✅ All 3 stages warmed up and ready!")
+        print("✅ All 3 stages warmed up and CUDAGraph-accelerated!")
+
+    def _reset_context_unlocked(self) -> None:
+        self.cache.reset()
+        self.seq_len = 0
+        sys_ids = [self.tokenizer.bos_token_id] + self.enc(self.sys_prompt)
+        with self._infer_stream_ctx(), torch.inference_mode():
+            inp = torch.tensor([sys_ids], dtype=torch.long, device=self.device)
+            _ = self._prefill_thinker_unlocked(inp)
+            if self.infer_cuda_stream is not None:
+                self.infer_cuda_stream.synchronize()
 
     def reset_context(self) -> None:
         with self.lock:
-            self.cache = DynamicCache()
-            sys_ids = [self.tokenizer.bos_token_id] + self.enc(self.sys_prompt)
-            with torch.inference_mode():
-                inp = torch.tensor([sys_ids], dtype=torch.long, device=self.device)
-                out = self.thinker(input_ids=inp, past_key_values=self.cache, use_cache=True, logits_to_keep=1)
-                self.cache = out.past_key_values
-            self.seq_len = len(sys_ids)
+            self._reset_context_unlocked()
 
     @torch.inference_mode()
     def prefill_audio_tick(self, wav_048s: np.ndarray, rollback_on_ignore: bool = False) -> Tuple[str, float]:
         """Fast (~11ms on A100) single-chunk audio state check (<unused1> listen, <unused5> ignore, <unused6> barge-in)."""
-        with self.lock:
+        with self.lock, self._infer_stream_ctx():
             if self.seq_len > 2800:
-                self.reset_context()
+                self._reset_context_unlocked()
             prev_seq_len = self.seq_len
             t0 = time.perf_counter()
             rms = float(np.sqrt(np.mean(wav_048s**2) + 1e-12))
             wav_use = wav_048s.astype(np.float32)
-            if rms >= 0.018:
-                gain = min(3.2, 0.085 / rms)
+            if rms >= 0.008:
+                gain = min(3.5, 0.085 / rms)
                 wav_use = np.clip(wav_use * gain, -0.96, 0.96)
 
             feat = self.fe([wav_use], sampling_rate=SR_IN, return_tensors="pt")
@@ -308,43 +442,23 @@ class Route2OmniEngine:
                 + self.enc("<turn|>\n<|turn>model\n")
             )
             inp = torch.tensor([chunk_ids], dtype=torch.long, device=self.device)
-            pos = torch.arange(self.seq_len, self.seq_len + len(chunk_ids), dtype=torch.long, device=self.device).unsqueeze(0)
-            attn = torch.ones((1, self.seq_len + len(chunk_ids)), dtype=torch.long, device=self.device)
-            out = self.thinker(
-                input_ids=inp,
-                position_ids=pos,
-                attention_mask=attn,
+            _, logits_last = self._prefill_thinker_unlocked(
+                inp,
                 input_features=feat["input_features"].to(self.device, self.dtype),
                 input_features_mask=feat["input_features_mask"].to(self.device),
-                past_key_values=self.cache,
-                use_cache=True,
-                logits_to_keep=1,
             )
-            self.cache = out.past_key_values
-            self.seq_len += len(chunk_ids)
 
-            first_id = int(out.logits[0, -1].argmax().item())
-            # Roll back ambient noise / echo frames (<unused5>) so idle KV cache stays 100% pure!
+            first_id = int(logits_last.argmax().item())
             if rollback_on_ignore and first_id not in (7, 12):  # 7=<unused1>, 12=<unused6>
                 self._crop_cache(prev_seq_len)
                 raw_state = self.tokenizer.decode([first_id], skip_special_tokens=False)
                 return raw_state, (time.perf_counter() - t0) * 1000.0
 
             gen_ids = [first_id]
-            # If <unused6> barge-in, check next 1..3 tokens in case of <unused6><unused1> or <unused6><unused7>c1
             cur_id = first_id
             if first_id == 12:  # <unused6>
                 for _ in range(3):
-                    s_inp = torch.tensor([[cur_id]], dtype=torch.long, device=self.device)
-                    s_pos = torch.tensor([[self.seq_len]], dtype=torch.long, device=self.device)
-                    s_attn = torch.ones((1, self.seq_len + 1), dtype=torch.long, device=self.device)
-                    s_out = self.thinker(
-                        input_ids=s_inp, position_ids=s_pos, attention_mask=s_attn,
-                        past_key_values=self.cache, use_cache=True, logits_to_keep=1,
-                    )
-                    self.cache = s_out.past_key_values
-                    self.seq_len += 1
-                    cur_id = int(s_out.logits[0, -1].argmax().item())
+                    _, cur_id = self._step_thinker_1tok_unlocked(cur_id)
                     if cur_id in (self.turn_end_id, self.tokenizer.eos_token_id):
                         break
                     gen_ids.append(cur_id)
@@ -353,14 +467,9 @@ class Route2OmniEngine:
                 tail = [first_id, self.turn_end_id, self.newline_id]
 
             t_inp = torch.tensor([tail], dtype=torch.long, device=self.device)
-            t_pos = torch.arange(self.seq_len, self.seq_len + len(tail), dtype=torch.long, device=self.device).unsqueeze(0)
-            t_attn = torch.ones((1, self.seq_len + len(tail)), dtype=torch.long, device=self.device)
-            t_out = self.thinker(
-                input_ids=t_inp, position_ids=t_pos, attention_mask=t_attn,
-                past_key_values=self.cache, use_cache=True, logits_to_keep=1,
-            )
-            self.cache = t_out.past_key_values
-            self.seq_len += len(tail)
+            _ = self._prefill_thinker_unlocked(t_inp)
+            if self.infer_cuda_stream is not None:
+                self.infer_cuda_stream.synchronize()
 
             raw_state = self.tokenizer.decode(gen_ids, skip_special_tokens=False)
             return raw_state, (time.perf_counter() - t0) * 1000.0
@@ -407,7 +516,7 @@ class Route2OmniEngine:
                             self.vocoder.abort_session(voc_sess)
                             break
 
-                        pcm_f32 = self.vocoder.push_units(batch_u, voc_sess, finalize=saw_end, min_chunk_units=17)
+                        pcm_f32 = self.vocoder.push_units(batch_u, voc_sess, finalize=saw_end, min_chunk_units=7)
                         if self.voc_cuda_stream is not None:
                             self.voc_cuda_stream.synchronize()
                         if len(pcm_f32) > 0:
@@ -425,9 +534,9 @@ class Route2OmniEngine:
             clean_spoken = ""
             aborted_or_short = False
             try:
-                with self.lock, torch.inference_mode():
+                with self.lock, self._infer_stream_ctx(), torch.inference_mode():
                     if self.seq_len > 2800:
-                        self.reset_context()
+                        self._reset_context_unlocked()
 
                     if trigger_mode == "tool_obs" and tool_obs is not None:
                         chunk_ids = self.enc(f"<|turn>tool\n{tool_obs}<turn|>\n<|turn>model\n")
@@ -437,22 +546,16 @@ class Route2OmniEngine:
                         chunk_ids = self.enc("<|turn>user\n<unused0><turn|>\n<|turn>model\n")
 
                     inp = torch.tensor([chunk_ids], dtype=torch.long, device=self.device)
-                    m_out = self.thinker.model(input_ids=inp, past_key_values=self.cache, use_cache=True, return_dict=True)
-                    self.cache = m_out.past_key_values
-                    self.seq_len += len(chunk_ids)
-
-                    last_h = m_out.last_hidden_state[:, -1:, :]
-                    logits_1 = self.thinker.lm_head(last_h)
-                    pred_h = last_h[0, 0, :]
-                    next_id = int(logits_1[0, 0].argmax().item())
+                    pred_h, logits_last = self._prefill_thinker_unlocked(inp)
+                    next_id = int(logits_last.argmax().item())
 
                     # Short-circuit if Thinker decides not to speak (<unused1>, <unused4>, <unused5>)
                     if next_id in (7, 10, 11):
                         tail = [next_id, self.turn_end_id, self.newline_id]
                         t_inp = torch.tensor([tail], dtype=torch.long, device=self.device)
-                        t_out = self.thinker.model(input_ids=t_inp, past_key_values=self.cache, use_cache=True, return_dict=True)
-                        self.cache = t_out.past_key_values
-                        self.seq_len += len(tail)
+                        _ = self._prefill_thinker_unlocked(t_inp)
+                        if self.infer_cuda_stream is not None:
+                            self.infer_cuda_stream.synchronize()
                         unit_q.put(None)
                         aborted_or_short = True
                         event_q.put(("state_only", self.tokenizer.decode([next_id], skip_special_tokens=False)))
@@ -468,19 +571,21 @@ class Route2OmniEngine:
                             unit_q.put(None)
                             close_ids = [self.turn_end_id, self.newline_id]
                             c_inp = torch.tensor([close_ids], dtype=torch.long, device=self.device)
-                            c_out = self.thinker.model(input_ids=c_inp, past_key_values=self.cache, use_cache=True, return_dict=True)
-                            self.cache = c_out.past_key_values
-                            self.seq_len += 2
+                            _ = self._prefill_thinker_unlocked(c_inp)
+                            if self.infer_cuda_stream is not None:
+                                self.infer_cuda_stream.synchronize()
                             aborted_or_short = True
                             return
 
                         is_end = (next_id == self.turn_end_id or next_id == self.tokenizer.eos_token_id)
                         if is_end:
                             for sub_u, sub_fin in self.talker.iter_turn_end_chunks(
-                                pred_h, talker_sess, temperature=0.55, subchunk_size=12
+                                pred_h, talker_sess, temperature=0.55, subchunk_size=14
                             ):
                                 if abort_flag is not None and abort_flag.is_set():
                                     break
+                                if self.infer_cuda_stream is not None:
+                                    self.infer_cuda_stream.synchronize()
                                 unit_q.put((sub_u, sub_fin))
                             break
 
@@ -493,6 +598,8 @@ class Route2OmniEngine:
                             temperature=0.55,
                         )
                         if u_chunk:
+                            if self.infer_cuda_stream is not None:
+                                self.infer_cuda_stream.synchronize()
                             unit_q.put((u_chunk, False))
 
                         gen_ids.append(next_id)
@@ -503,26 +610,20 @@ class Route2OmniEngine:
                                 event_q.put(("tool_call", calls[emitted_tool_count]))
                                 emitted_tool_count += 1
 
-                        s_inp = torch.tensor([[next_id]], dtype=torch.long, device=self.device)
-                        s_out = self.thinker.model(input_ids=s_inp, past_key_values=self.cache, use_cache=True, return_dict=True)
-                        self.cache = s_out.past_key_values
-                        self.seq_len += 1
-                        last_h = s_out.last_hidden_state[:, -1:, :]
-                        logits_1 = self.thinker.lm_head(last_h)
-                        pred_h = last_h[0, 0, :]
-                        next_id = int(logits_1[0, 0].argmax().item())
+                        pred_h, next_id = self._step_thinker_1tok_unlocked(next_id)
                     else:
-                        # Reached 96-token cap without <turn|>: ensure vocoder receives finalize!
                         u_tail = self.talker.step_gemma_token(
                             self.tokenizer, self.turn_end_id, pred_h, talker_sess, is_turn_end=True, temperature=0.55
                         )
+                        if self.infer_cuda_stream is not None:
+                            self.infer_cuda_stream.synchronize()
                         unit_q.put((u_tail, True))
 
                     end_tail = [self.turn_end_id, self.newline_id]
                     e_inp = torch.tensor([end_tail], dtype=torch.long, device=self.device)
-                    e_out = self.thinker.model(input_ids=e_inp, past_key_values=self.cache, use_cache=True, return_dict=True)
-                    self.cache = e_out.past_key_values
-                    self.seq_len += 2
+                    _ = self._prefill_thinker_unlocked(e_inp)
+                    if self.infer_cuda_stream is not None:
+                        self.infer_cuda_stream.synchronize()
 
                     raw_full = self.tokenizer.decode(gen_ids, skip_special_tokens=False)
                     clean_spoken, _ = parse_gemma4_tool_calls(raw_full)
@@ -657,11 +758,11 @@ function playPcm24kBase64(b64) {
 
   const now = audioCtx.currentTime;
   if (isFirstChunkOfTurn) {
-    // 320ms jitter cushion + 520ms Chunk-0 audio = 840ms continuous runway so subsequent 800ms chunks never underrun
-    nextPlayTime = Math.max(nextPlayTime, now + 0.32);
+    // 160ms jitter cushion with CUDAGraph (~22ms/cycle on A100 -> continuous zero-gap stream!)
+    nextPlayTime = Math.max(nextPlayTime, now + 0.16);
     isFirstChunkOfTurn = false;
   } else if (nextPlayTime < now + 0.01) {
-    nextPlayTime = now + 0.05;
+    nextPlayTime = now + 0.04;
   }
   src.start(nextPlayTime);
   nextPlayTime += buf.duration;
@@ -997,7 +1098,7 @@ def create_app(engine: Route2OmniEngine) -> FastAPI:
                                 wav_sim = wav_sim[max(0, (nz[0] - 1) * win) : min(len(wav_sim), (nz[-1] + 2) * win)]
                         for start in range(0, len(wav_sim), CHUNK_SAMPLES):
                             seg = wav_sim[start : start + CHUNK_SAMPLES]
-                            if start > 0 and len(seg) < 1600:
+                            if start > 0 and len(seg) < 3200:
                                 break
                             if len(seg) < CHUNK_SAMPLES:
                                 seg = np.pad(seg, (0, CHUNK_SAMPLES - len(seg)))
