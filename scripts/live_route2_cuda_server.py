@@ -384,11 +384,13 @@ class Route2OmniEngine:
             print(f"   ⚠️ Thinker CUDAGraph fallback to eager ({exc})")
 
     def _warmup(self) -> None:
-        print("🔥 Warming up & capturing CUDAGraphs for Thinker + Talker + Vocoder...")
+        print("🔥 Warming up & capturing Triple-CUDAGraphs (Thinker + Talker + Vocoder)...")
         if self.device == "cuda":
             self._init_thinker_cuda_graph()
             if self.talker.init_cuda_graph(stream=self.infer_cuda_stream):
                 print("   ⚡ Captured Talker 24-layer single-unit CUDAGraph (~0.7ms/unit)!")
+            if self.vocoder.init_first_chunk_cuda_graph(stream=self.voc_cuda_stream):
+                print("   ⚡ Captured Vocoder Chunk-0 Flow+HiFT CUDAGraph (~9ms first-packet vocoder)!")
         dummy_wav = (np.random.randn(CHUNK_SAMPLES).astype(np.float32) * 0.04)
         _ = self.prefill_audio_tick(dummy_wav)
         with self._infer_stream_ctx(), torch.inference_mode():

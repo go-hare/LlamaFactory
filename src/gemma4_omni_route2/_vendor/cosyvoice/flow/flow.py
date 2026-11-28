@@ -202,8 +202,9 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         embedding = self.spk_embed_affine_layer(embedding)
 
         # concat text and prompt_text
+        total_tok_len = int(prompt_token.shape[1] + token.shape[1])
         token, token_len = torch.concat([prompt_token, token], dim=1), prompt_token_len + token_len
-        mask = (~make_pad_mask(token_len)).unsqueeze(-1).to(embedding)
+        mask = (~make_pad_mask(token_len, max_len=total_tok_len)).unsqueeze(-1).to(embedding)
         token = self.input_embedding(torch.clamp(token, min=0)) * mask
 
         # text encode
@@ -214,17 +215,19 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         h = self.encoder_proj(h)
 
         # get conditions
-        conds = torch.zeros([1, mel_len1 + mel_len2, self.output_size], device=token.device)
-        conds[:, :mel_len1] = prompt_feat
+        total_mel_len = int(mel_len1 + mel_len2)
+        conds = torch.zeros([1, total_mel_len, self.output_size], device=token.device, dtype=h.dtype)
+        if mel_len1 > 0:
+            conds[:, :mel_len1] = prompt_feat
         conds = conds.transpose(1, 2)
 
-        mask = (~make_pad_mask(torch.tensor([mel_len1 + mel_len2]))).to(h)
+        mask = torch.ones((1, total_mel_len), dtype=h.dtype, device=h.device)
         feat, _ = self.decoder(
             mu=h.transpose(1, 2).contiguous(),
             mask=mask.unsqueeze(1),
             spks=embedding,
             cond=conds,
-            n_timesteps=6
+            n_timesteps=4 if (not finalize and total_mel_len <= 20) else 6
         )
         feat = feat[:, :, mel_len1:]
         assert feat.shape[2] == mel_len2

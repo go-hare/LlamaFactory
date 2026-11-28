@@ -153,6 +153,7 @@ class Gemma4SpeechGenerator(nn.Module):
         self.sep_token_id = int(self.tokenizer.convert_tokens_to_ids("<sep>"))  # 151665
         self.unit_offset = int(self.tokenizer.convert_tokens_to_ids("<0>"))  # 151666
         self.eos_token_id = int(self.tokenizer.eos_token_id)  # 151643
+        self.prosody_gate_cap: Optional[float] = None
         self._cuda_graph: Optional[torch.cuda.CUDAGraph] = None
         self._graph_cache: Optional[StaticGraphCache] = None
         self._g_tok_id: Optional[torch.Tensor] = None
@@ -358,6 +359,8 @@ class Gemma4SpeechGenerator(nn.Module):
         ckpt_dir: str,
         torch_dtype: torch.dtype = torch.bfloat16,
         device: Optional[str] = None,
+        restore_pristine_backbone: bool = True,
+        donor_repo_id: str = "ICTNLP/LLaMA-Omni2-1.5B-Bilingual",
     ) -> "Gemma4SpeechGenerator":
         if not os.path.isdir(ckpt_dir):
             ckpt_dir = snapshot_download(ckpt_dir)
@@ -372,6 +375,22 @@ class Gemma4SpeechGenerator(nn.Module):
         )
         sd = load_file(os.path.join(ckpt_dir, "talker_model.safetensors"))
         inst.load_state_dict(sd, strict=True)
+        if restore_pristine_backbone:
+            # Keep trained Gemma-4 -> Talker bridge (gemma_norm + input_proj + gate), while restoring
+            # the 100% pristine 200K-dialogue pretrained 24-layer speech_generator.model weights!
+            try:
+                shard_path = hf_hub_download(donor_repo_id, "model-00002-of-00002.safetensors")
+                donor_sd = load_file(shard_path)
+                pristine_model_sd = {
+                    k[len("speech_generator.model.") :]: v
+                    for k, v in donor_sd.items()
+                    if k.startswith("speech_generator.model.")
+                }
+                inst.model.load_state_dict(pristine_model_sd, strict=True)
+                inst.prosody_gate_cap = 0.15
+                print("   ✅ Restored pristine 200K-dialogue 24-layer Talker + Gemma-4 prosody bridge!")
+            except Exception as exc:
+                print(f"   ⚠️ Kept checkpoint Talker backbone ({exc})")
         inst = inst.to(dtype=torch_dtype)
         if device is not None:
             inst = inst.to(device)
@@ -388,6 +407,12 @@ class Gemma4SpeechGenerator(nn.Module):
         rep = self.input_proj(normed)
         emb = self.model.get_input_embeddings()(tts_token_ids).to(dtype=target_dtype)
         g = self.gate(torch.cat([rep, emb], dim=-1))
+        if self.prosody_gate_cap is not None:
+            # Match rep RMS norm to emb RMS norm so Gemma-4 prosody enriches without shifting phonetic manifold
+            emb_rms = emb.float().pow(2).mean(dim=-1, keepdim=True).add(1e-8).sqrt()
+            rep_rms = rep.float().pow(2).mean(dim=-1, keepdim=True).add(1e-8).sqrt()
+            rep = (rep.float() * (emb_rms / rep_rms)).to(dtype=target_dtype)
+            g = g * float(self.prosody_gate_cap)
         fused = rep * g + emb * (1.0 - g)
         return fused, g.mean()
 
