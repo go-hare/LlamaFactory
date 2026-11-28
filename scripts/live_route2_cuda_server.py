@@ -908,6 +908,8 @@ def create_app(engine: Route2OmniEngine) -> FastAPI:
         except WebSocketDisconnect:
             abort_event.set()
 
+    return app
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
