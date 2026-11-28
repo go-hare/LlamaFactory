@@ -14,6 +14,7 @@ import asyncio
 import base64
 import json
 import os
+import queue
 import re
 import sys
 import threading
@@ -204,6 +205,11 @@ class Route2OmniEngine:
         prompt_wav: Optional[str] = None,
     ):
         self.device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+        if self.device == "cuda":
+            torch.set_float32_matmul_precision("high")
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
         self.dtype = torch.bfloat16 if self.device in ("cuda", "mps") else torch.float32
         print(f"🚀 [1/3] Loading Stage-1 Thinker ({base_model} + {stage1_adapter}) on {self.device}...")
 
@@ -234,6 +240,7 @@ class Route2OmniEngine:
         print(f"🚀 [3/3] Loading Stage-3 CosyVoice2 24kHz Streaming Vocoder on {voc_dev}...")
         # Use official LLaMA-Omni2 zero-prompt x-vector streaming mode (5.6x faster first-packet ODE!)
         self.vocoder = Cosy2StreamingVocoder(device=voc_dev, prompt_wav_path=prompt_wav, use_zero_shot_prompt=False)
+        self.voc_cuda_stream = torch.cuda.Stream() if self.device == "cuda" else None
 
         self.turn_end_id = self.enc("<turn|>")[0]
         self.newline_id = self.enc("\n")[0]
@@ -357,7 +364,6 @@ class Route2OmniEngine:
             raw_state = self.tokenizer.decode(gen_ids, skip_special_tokens=False)
             return raw_state, (time.perf_counter() - t0) * 1000.0
 
-    @torch.inference_mode()
     def stream_response_generator(
         self,
         trigger_mode: str = "silence",
@@ -365,138 +371,172 @@ class Route2OmniEngine:
         text_query: Optional[str] = None,
         abort_flag: Optional[threading.Event] = None,
     ):
-        """Yields streaming events: ('tool_call', call_dict), ('text_delta', str), ('audio_pcm', bytes, float_ms), ('done', full_text)."""
-        with self.lock:
-            if self.seq_len > 2800:
-                self.reset_context()
-            t_start = time.perf_counter()
+        """Dual-thread pipelined streaming: Thinker+Talker producer || Vocoder CUDA-stream consumer (zero buffer underrun)."""
+        t_start = time.perf_counter()
+        event_q: queue.Queue = queue.Queue()
+        unit_q: queue.Queue = queue.Queue()
+        voc_done_evt = threading.Event()
+        first_audio_box: List[Optional[float]] = [None]
+        voc_sess = self.vocoder.init_session()
 
-            if trigger_mode == "tool_obs" and tool_obs is not None:
-                chunk_ids = self.enc(f"<|turn>tool\n{tool_obs}<turn|>\n<|turn>model\n")
-            elif trigger_mode == "text" and text_query is not None:
-                chunk_ids = self.enc(f"<|turn>user\n{text_query}<turn|>\n<|turn>model\n")
-            else:
-                chunk_ids = self.enc("<|turn>user\n<unused0><turn|>\n<|turn>model\n")
+        def _vocoder_worker() -> None:
+            try:
+                ctx = torch.cuda.stream(self.voc_cuda_stream) if self.voc_cuda_stream is not None else torch.inference_mode()
+                with ctx, torch.inference_mode():
+                    while True:
+                        item = unit_q.get()
+                        if item is None:
+                            self.vocoder.abort_session(voc_sess)
+                            break
+                        batch_u, saw_end = list(item[0]), bool(item[1])
+                        # Coalesce all units already generated while previous chunk was synthesizing!
+                        while not saw_end:
+                            try:
+                                nxt = unit_q.get_nowait()
+                            except queue.Empty:
+                                break
+                            if nxt is None:
+                                self.vocoder.abort_session(voc_sess)
+                                return
+                            batch_u.extend(nxt[0])
+                            if nxt[1]:
+                                saw_end = True
 
-            inp = torch.tensor([chunk_ids], dtype=torch.long, device=self.device)
-            pos = torch.arange(self.seq_len, self.seq_len + len(chunk_ids), dtype=torch.long, device=self.device).unsqueeze(0)
-            attn = torch.ones((1, self.seq_len + len(chunk_ids)), dtype=torch.long, device=self.device)
-            out = self.thinker(
-                input_ids=inp,
-                position_ids=pos,
-                attention_mask=attn,
-                past_key_values=self.cache,
-                use_cache=True,
-                output_hidden_states=True,
-                logits_to_keep=1,
-                return_dict=True,
-            )
-            self.cache = out.past_key_values
-            self.seq_len += len(chunk_ids)
+                        if abort_flag is not None and abort_flag.is_set():
+                            self.vocoder.abort_session(voc_sess)
+                            break
 
-            talker_sess = TalkerStreamSession()
-            voc_sess = self.vocoder.init_session()
+                        pcm_f32 = self.vocoder.push_units(batch_u, voc_sess, finalize=saw_end, min_chunk_units=17)
+                        if self.voc_cuda_stream is not None:
+                            self.voc_cuda_stream.synchronize()
+                        if len(pcm_f32) > 0:
+                            if first_audio_box[0] is None:
+                                first_audio_box[0] = (time.perf_counter() - t_start) * 1000.0
+                            pcm_i16 = np.clip(pcm_f32 * 32767.0, -32768, 32767).astype(np.int16).tobytes()
+                            event_q.put(("audio_pcm", pcm_i16, first_audio_box[0]))
+                        if saw_end:
+                            break
+            finally:
+                voc_done_evt.set()
 
-            gen_ids: List[int] = []
-            emitted_tool_count = 0
-            first_audio_ms: Optional[float] = None
+        def _thinker_talker_worker() -> None:
+            raw_full = ""
+            clean_spoken = ""
+            aborted_or_short = False
+            try:
+                with self.lock, torch.inference_mode():
+                    if self.seq_len > 2800:
+                        self.reset_context()
 
-            pred_h = out.hidden_states[-1][0, -1, :]
-            next_id = int(out.logits[0, -1].argmax().item())
+                    if trigger_mode == "tool_obs" and tool_obs is not None:
+                        chunk_ids = self.enc(f"<|turn>tool\n{tool_obs}<turn|>\n<|turn>model\n")
+                    elif trigger_mode == "text" and text_query is not None:
+                        chunk_ids = self.enc(f"<|turn>user\n{text_query}<turn|>\n<|turn>model\n")
+                    else:
+                        chunk_ids = self.enc("<|turn>user\n<unused0><turn|>\n<|turn>model\n")
 
-            # Short-circuit if Thinker decides not to speak (<unused1>, <unused4>, <unused5>)
-            if next_id in (7, 10, 11):  # <unused1>, <unused4>, <unused5>
-                tail = [next_id, self.turn_end_id, self.newline_id]
-                t_inp = torch.tensor([tail], dtype=torch.long, device=self.device)
-                t_pos = torch.arange(self.seq_len, self.seq_len + len(tail), dtype=torch.long, device=self.device).unsqueeze(0)
-                t_attn = torch.ones((1, self.seq_len + len(tail)), dtype=torch.long, device=self.device)
-                t_out = self.thinker(
-                    input_ids=t_inp, position_ids=t_pos, attention_mask=t_attn,
-                    past_key_values=self.cache, use_cache=True, logits_to_keep=1,
-                )
-                self.cache = t_out.past_key_values
-                self.seq_len += len(tail)
-                yield ("state_only", self.tokenizer.decode([next_id], skip_special_tokens=False))
-                return
+                    inp = torch.tensor([chunk_ids], dtype=torch.long, device=self.device)
+                    m_out = self.thinker.model(input_ids=inp, past_key_values=self.cache, use_cache=True, return_dict=True)
+                    self.cache = m_out.past_key_values
+                    self.seq_len += len(chunk_ids)
 
-            for _ in range(96):
-                if abort_flag is not None and abort_flag.is_set():
-                    self.vocoder.abort_session(voc_sess)
-                    talker_sess.reset()
-                    # Close turn cleanly in Thinker KV cache
-                    close_ids = [self.turn_end_id, self.newline_id]
-                    c_inp = torch.tensor([close_ids], dtype=torch.long, device=self.device)
-                    c_pos = torch.arange(self.seq_len, self.seq_len + 2, dtype=torch.long, device=self.device).unsqueeze(0)
-                    c_attn = torch.ones((1, self.seq_len + 2), dtype=torch.long, device=self.device)
-                    c_out = self.thinker(
-                        input_ids=c_inp, position_ids=c_pos, attention_mask=c_attn,
-                        past_key_values=self.cache, use_cache=True, logits_to_keep=1,
-                    )
-                    self.cache = c_out.past_key_values
+                    last_h = m_out.last_hidden_state[:, -1:, :]
+                    logits_1 = self.thinker.lm_head(last_h)
+                    pred_h = last_h[0, 0, :]
+                    next_id = int(logits_1[0, 0].argmax().item())
+
+                    # Short-circuit if Thinker decides not to speak (<unused1>, <unused4>, <unused5>)
+                    if next_id in (7, 10, 11):
+                        tail = [next_id, self.turn_end_id, self.newline_id]
+                        t_inp = torch.tensor([tail], dtype=torch.long, device=self.device)
+                        t_out = self.thinker.model(input_ids=t_inp, past_key_values=self.cache, use_cache=True, return_dict=True)
+                        self.cache = t_out.past_key_values
+                        self.seq_len += len(tail)
+                        unit_q.put(None)
+                        aborted_or_short = True
+                        event_q.put(("state_only", self.tokenizer.decode([next_id], skip_special_tokens=False)))
+                        return
+
+                    talker_sess = TalkerStreamSession()
+                    gen_ids: List[int] = []
+                    emitted_tool_count = 0
+
+                    for _ in range(96):
+                        if abort_flag is not None and abort_flag.is_set():
+                            talker_sess.reset()
+                            unit_q.put(None)
+                            close_ids = [self.turn_end_id, self.newline_id]
+                            c_inp = torch.tensor([close_ids], dtype=torch.long, device=self.device)
+                            c_out = self.thinker.model(input_ids=c_inp, past_key_values=self.cache, use_cache=True, return_dict=True)
+                            self.cache = c_out.past_key_values
+                            self.seq_len += 2
+                            aborted_or_short = True
+                            return
+
+                        is_end = (next_id == self.turn_end_id or next_id == self.tokenizer.eos_token_id)
+                        u_chunk = self.talker.step_gemma_token(
+                            self.tokenizer,
+                            next_id,
+                            pred_h,
+                            talker_sess,
+                            is_turn_end=is_end,
+                            temperature=0.55,
+                        )
+                        if u_chunk or is_end:
+                            unit_q.put((u_chunk, is_end))
+
+                        if is_end:
+                            break
+
+                        gen_ids.append(next_id)
+                        if next_id == self.tc_end_id:
+                            raw_so_far = self.tokenizer.decode(gen_ids, skip_special_tokens=False)
+                            _, calls = parse_gemma4_tool_calls(raw_so_far)
+                            while emitted_tool_count < len(calls):
+                                event_q.put(("tool_call", calls[emitted_tool_count]))
+                                emitted_tool_count += 1
+
+                        s_inp = torch.tensor([[next_id]], dtype=torch.long, device=self.device)
+                        s_out = self.thinker.model(input_ids=s_inp, past_key_values=self.cache, use_cache=True, return_dict=True)
+                        self.cache = s_out.past_key_values
+                        self.seq_len += 1
+                        last_h = s_out.last_hidden_state[:, -1:, :]
+                        logits_1 = self.thinker.lm_head(last_h)
+                        pred_h = last_h[0, 0, :]
+                        next_id = int(logits_1[0, 0].argmax().item())
+                    else:
+                        # Reached 96-token cap without <turn|>: ensure vocoder receives finalize!
+                        u_tail = self.talker.step_gemma_token(
+                            self.tokenizer, self.turn_end_id, pred_h, talker_sess, is_turn_end=True, temperature=0.55
+                        )
+                        unit_q.put((u_tail, True))
+
+                    end_tail = [self.turn_end_id, self.newline_id]
+                    e_inp = torch.tensor([end_tail], dtype=torch.long, device=self.device)
+                    e_out = self.thinker.model(input_ids=e_inp, past_key_values=self.cache, use_cache=True, return_dict=True)
+                    self.cache = e_out.past_key_values
                     self.seq_len += 2
-                    return
 
-                is_end = (next_id == self.turn_end_id or next_id == self.tokenizer.eos_token_id)
-                u_chunk = self.talker.step_gemma_token(
-                    self.tokenizer,
-                    next_id,
-                    pred_h,
-                    talker_sess,
-                    is_turn_end=is_end,
-                    temperature=0.55,
-                )
-                if u_chunk or is_end:
-                    pcm_f32 = self.vocoder.push_units(u_chunk, voc_sess, finalize=is_end, min_chunk_units=5)
-                    if len(pcm_f32) > 0:
-                        if first_audio_ms is None:
-                            first_audio_ms = (time.perf_counter() - t_start) * 1000.0
-                        pcm_i16 = np.clip(pcm_f32 * 32767.0, -32768, 32767).astype(np.int16).tobytes()
-                        yield ("audio_pcm", pcm_i16, first_audio_ms)
+                    raw_full = self.tokenizer.decode(gen_ids, skip_special_tokens=False)
+                    clean_spoken, _ = parse_gemma4_tool_calls(raw_full)
 
-                if is_end:
-                    break
+                # Wait outside self.lock for final Vocoder chunk so all audio_pcm arrive strictly before 'done'
+                voc_done_evt.wait(timeout=15.0)
+                if not aborted_or_short and not (abort_flag is not None and abort_flag.is_set()):
+                    event_q.put(("done", raw_full, clean_spoken, first_audio_box[0] or 0.0))
+            finally:
+                unit_q.put(None)
+                voc_done_evt.wait(timeout=5.0)
+                event_q.put(("__eof__",))
 
-                gen_ids.append(next_id)
-                if next_id == self.tc_end_id:
-                    raw_so_far = self.tokenizer.decode(gen_ids, skip_special_tokens=False)
-                    _, calls = parse_gemma4_tool_calls(raw_so_far)
-                    while emitted_tool_count < len(calls):
-                        yield ("tool_call", calls[emitted_tool_count])
-                        emitted_tool_count += 1
+        threading.Thread(target=_vocoder_worker, daemon=True).start()
+        threading.Thread(target=_thinker_talker_worker, daemon=True).start()
 
-                s_inp = torch.tensor([[next_id]], dtype=torch.long, device=self.device)
-                s_pos = torch.tensor([[self.seq_len]], dtype=torch.long, device=self.device)
-                s_attn = torch.ones((1, self.seq_len + 1), dtype=torch.long, device=self.device)
-                s_out = self.thinker(
-                    input_ids=s_inp,
-                    position_ids=s_pos,
-                    attention_mask=s_attn,
-                    past_key_values=self.cache,
-                    use_cache=True,
-                    output_hidden_states=True,
-                    logits_to_keep=1,
-                    return_dict=True,
-                )
-                self.cache = s_out.past_key_values
-                self.seq_len += 1
-                pred_h = s_out.hidden_states[-1][0, -1, :]
-                next_id = int(s_out.logits[0, -1].argmax().item())
-
-            # Append <turn|>\n to Thinker KV cache
-            end_tail = [self.turn_end_id, self.newline_id]
-            e_inp = torch.tensor([end_tail], dtype=torch.long, device=self.device)
-            e_pos = torch.arange(self.seq_len, self.seq_len + 2, dtype=torch.long, device=self.device).unsqueeze(0)
-            e_attn = torch.ones((1, self.seq_len + 2), dtype=torch.long, device=self.device)
-            e_out = self.thinker(
-                input_ids=e_inp, position_ids=e_pos, attention_mask=e_attn,
-                past_key_values=self.cache, use_cache=True, logits_to_keep=1,
-            )
-            self.cache = e_out.past_key_values
-            self.seq_len += 2
-
-            raw_full = self.tokenizer.decode(gen_ids, skip_special_tokens=False)
-            clean_spoken, _ = parse_gemma4_tool_calls(raw_full)
-            yield ("done", raw_full, clean_spoken, first_audio_ms or 0.0)
+        while True:
+            ev = event_q.get()
+            if ev[0] == "__eof__":
+                break
+            yield ev
 
 
 HTML_PAGE = """<!DOCTYPE html>
@@ -562,6 +602,7 @@ let nextPlayTime = 0;
 let activeSources = [];
 let isAiPlaying = false;
 let lastPlayEndMs = 0;
+let isFirstChunkOfTurn = true;
 
 function addLog(cls, text) {
   const el = document.getElementById('log');
@@ -585,6 +626,7 @@ function stopAllPlayback() {
   }
   activeSources = [];
   nextPlayTime = 0;
+  isFirstChunkOfTurn = true;
   if (isAiPlaying) lastPlayEndMs = performance.now();
   isAiPlaying = false;
 }
@@ -607,7 +649,13 @@ function playPcm24kBase64(b64) {
   src.connect(audioCtx.destination);
 
   const now = audioCtx.currentTime;
-  if (nextPlayTime < now + 0.015) nextPlayTime = now + 0.02;
+  if (isFirstChunkOfTurn) {
+    // 320ms jitter cushion + 520ms Chunk-0 audio = 840ms continuous runway so subsequent 800ms chunks never underrun
+    nextPlayTime = Math.max(nextPlayTime, now + 0.32);
+    isFirstChunkOfTurn = false;
+  } else if (nextPlayTime < now + 0.01) {
+    nextPlayTime = now + 0.05;
+  }
   src.start(nextPlayTime);
   nextPlayTime += buf.duration;
   isAiPlaying = true;
@@ -643,6 +691,7 @@ function connectWs() {
     } else if (msg.type === 'tool_call') {
       addLog('tool', `🔧 异步调用工具: ${msg.call.name}(${JSON.stringify(msg.call.args)})`);
     } else if (msg.type === 'assistant_done') {
+      isFirstChunkOfTurn = true;
       if (msg.text) addLog('ai', `🤖 ${msg.text}  [TTFA: ${msg.ttfa_ms.toFixed(0)}ms]`);
     } else if (msg.type === 'info') {
       addLog('sys', msg.text);

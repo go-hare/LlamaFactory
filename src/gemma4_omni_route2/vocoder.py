@@ -107,17 +107,15 @@ def extract_cosy2_mel_24k(speech_24k: torch.Tensor) -> torch.Tensor:
     return mel  # [B, 80, T_mel]
 
 
-def _fade_in_out(fade_in_mel: torch.Tensor, fade_out_mel: torch.Tensor, window: np.ndarray) -> torch.Tensor:
-    device = fade_in_mel.device
-    fade_in_cpu = fade_in_mel.cpu()
-    fade_out_cpu = fade_out_mel.cpu()
-    mel_overlap_len = int(window.shape[0] // 2)
-    win_t = torch.from_numpy(window).to(fade_in_cpu.dtype)
-    fade_in_cpu[..., :mel_overlap_len] = (
-        fade_in_cpu[..., :mel_overlap_len] * win_t[:mel_overlap_len]
-        + fade_out_cpu[..., -mel_overlap_len:] * win_t[mel_overlap_len:]
+def _fade_in_out(fade_in_mel: torch.Tensor, fade_out_mel: torch.Tensor, window_t: torch.Tensor) -> torch.Tensor:
+    mel_overlap_len = int(window_t.shape[0] // 2)
+    win = window_t.to(device=fade_in_mel.device, dtype=fade_in_mel.dtype)
+    fade_in_mel = fade_in_mel.clone()
+    fade_in_mel[..., :mel_overlap_len] = (
+        fade_in_mel[..., :mel_overlap_len] * win[:mel_overlap_len]
+        + fade_out_mel[..., -mel_overlap_len:] * win[mel_overlap_len:]
     )
-    return fade_in_cpu.to(device)
+    return fade_in_mel
 
 
 def extract_whisper_log_mel_128(wav_16k: torch.Tensor) -> torch.Tensor:
@@ -311,6 +309,7 @@ class Cosy2StreamingVocoder:
         self.mel_cache_len = 8
         self.source_cache_len = int(self.mel_cache_len * 480)
         self.speech_window = np.hamming(2 * self.source_cache_len)
+        self.speech_window_t = torch.from_numpy(self.speech_window).float().to(self.device)
         self.lock = threading.Lock()
         self.hift_cache_dict: dict[str, Optional[dict]] = {}
 
@@ -424,7 +423,7 @@ class Cosy2StreamingVocoder:
         if not finalize:
             tts_speech, tts_source = self.hift.inference(speech_feat=tts_mel, cache_source=hift_cache_source)
             if cache_entry is not None:
-                tts_speech = _fade_in_out(tts_speech, cache_entry["speech"], self.speech_window)
+                tts_speech = _fade_in_out(tts_speech, cache_entry["speech"], self.speech_window_t)
             self.hift_cache_dict[sid] = {
                 "mel": tts_mel[:, :, -self.mel_cache_len :].detach(),
                 "source": tts_source[:, :, -self.source_cache_len :].detach(),
@@ -434,7 +433,7 @@ class Cosy2StreamingVocoder:
         else:
             tts_speech, _ = self.hift.inference(speech_feat=tts_mel, cache_source=hift_cache_source)
             if cache_entry is not None:
-                tts_speech = _fade_in_out(tts_speech, cache_entry["speech"], self.speech_window)
+                tts_speech = _fade_in_out(tts_speech, cache_entry["speech"], self.speech_window_t)
             with self.lock:
                 self.hift_cache_dict.pop(sid, None)
         return tts_speech
@@ -445,7 +444,7 @@ class Cosy2StreamingVocoder:
         new_units: list[int],
         session: dict,
         finalize: bool = False,
-        min_chunk_units: int = 6,
+        min_chunk_units: int = 17,
     ) -> np.ndarray:
         """Push newly generated 25Hz units (0..6560) and return ready 24kHz float32 PCM samples."""
         if new_units:
@@ -462,9 +461,9 @@ class Cosy2StreamingVocoder:
             return np.zeros(0, dtype=np.float32)
 
         if not finalize:
-            # First packet (offset == 0) triggers at 5 units + lookahead (8 units) for minimal TTFA;
-            # subsequent chunks gather >= 8 units for ultra-smooth overlap-add continuity.
-            need_units = max(min_chunk_units, 5) if offset == 0 else max(min_chunk_units, 8)
+            # First packet (offset == 0): 17 + 3 = 20 units -> 0.52s net playable audio;
+            # subsequent packets: 17 + 3 = 20 units -> 0.80s seamless audio per pass (strictly faster than playback!).
+            need_units = max(min_chunk_units, 17)
             if avail < need_units + self.flow.pre_lookahead_len:
                 return np.zeros(0, dtype=np.float32)
         else:

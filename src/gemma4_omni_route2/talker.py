@@ -400,51 +400,33 @@ class Gemma4SpeechGenerator(nn.Module):
         )
         logits = out.logits[0, -1, :].float()
 
-        if not is_finished:
-            max_steps = self.write_len
-        else:
-            est_cap = max(24, session.spoken_char_count * 6 - len(session.recent_unit_ids) + 14)
-            max_steps = min(160, est_cap) if session.spoken_char_count > 0 else 160
-        emitted_units: list[int] = []
         u_start = self.unit_offset
         u_end = self.unit_offset + UNIT_VOCAB_SIZE  # 158227
 
-        for _ in range(max_steps):
-            # Restrict strictly to speech units <0>..<6560> (plus <eos> once is_finished=True)
-            allowed_logits = torch.full_like(logits, float("-inf"))
-            allowed_logits[u_start:u_end] = logits[u_start:u_end]
-            if is_finished:
-                allowed_logits[self.eos_token_id] = logits[self.eos_token_id]
-
-            # Guard against both 1-token stuck loops and 2-token breath/silence oscillations
+        if not is_finished:
+            # Zero-CPU-sync GPU loop over compact 6561-unit slice (24x smaller than full 158k vocab!)
+            gpu_unit_vals: list[torch.Tensor] = []
+            penalize_u: list[int] = []
             if len(session.recent_unit_ids) >= 8 and len(set(session.recent_unit_ids[-8:])) == 1:
-                allowed_logits[session.recent_unit_ids[-1]] -= 8.0
+                penalize_u = [session.recent_unit_ids[-1] - u_start]
             elif len(session.recent_unit_ids) >= 10 and len(set(session.recent_unit_ids[-10:])) <= 2:
-                for stuck_id in set(session.recent_unit_ids[-10:]):
-                    allowed_logits[stuck_id] -= 6.0
+                penalize_u = [sid - u_start for sid in set(session.recent_unit_ids[-10:])]
 
-            if temperature <= 1e-3:
-                next_id = int(torch.argmax(allowed_logits).item())
-            else:
-                scaled = allowed_logits / temperature
-                if top_k > 0:
-                    v, _ = torch.topk(scaled, min(top_k, UNIT_VOCAB_SIZE + 1))
-                    scaled[scaled < v[-1]] = float("-inf")
-                probs = F.softmax(scaled, dim=-1)
-                next_id = int(torch.multinomial(probs, num_samples=1).item())
-
-            # Append chosen token embedding into KV cache so next Read chunk sees exact autoregressive history
-            next_t = torch.tensor([[next_id]], dtype=torch.long, device=device)
-            if next_id == self.eos_token_id:
-                session.finished = True
-                break
-
-            unit_val = next_id - u_start
-            if 0 <= unit_val < UNIT_VOCAB_SIZE:
-                emitted_units.append(unit_val)
-                session.recent_unit_ids.append(next_id)
-
-            if len(emitted_units) < max_steps:
+            for _ in range(self.write_len):
+                u_logits = logits[u_start:u_end].clone()
+                for pu in penalize_u:
+                    if 0 <= pu < UNIT_VOCAB_SIZE:
+                        u_logits[pu] -= 7.0
+                if temperature <= 1e-3:
+                    u_idx = torch.argmax(u_logits)
+                else:
+                    scaled = u_logits / temperature
+                    if top_k > 0:
+                        v, _ = torch.topk(scaled, min(top_k, UNIT_VOCAB_SIZE))
+                        scaled.masked_fill_(scaled < v[-1], float("-inf"))
+                    u_idx = torch.multinomial(F.softmax(scaled, dim=-1), num_samples=1).squeeze(0)
+                gpu_unit_vals.append(u_idx)
+                next_t = (u_idx + u_start).view(1, 1)
                 step_out = self.model(
                     inputs_embeds=embed_fn(next_t).to(dtype=dtype),
                     past_key_values=session.kv_cache,
@@ -453,15 +435,58 @@ class Gemma4SpeechGenerator(nn.Module):
                     return_dict=True,
                 )
                 logits = step_out.logits[0, -1, :].float()
+
+            emitted_units = torch.stack(gpu_unit_vals).tolist()
+            session.recent_unit_ids.extend(u + u_start for u in emitted_units)
+            return emitted_units
+
+        est_cap = max(24, session.spoken_char_count * 6 - len(session.recent_unit_ids) + 14)
+        max_steps = min(160, est_cap) if session.spoken_char_count > 0 else 160
+        emitted_units: list[int] = []
+
+        for _ in range(max_steps):
+            # Compact 6562-way candidate vector: [u_0 .. u_6560, <eos>]
+            cand_logits = torch.empty(UNIT_VOCAB_SIZE + 1, dtype=logits.dtype, device=device)
+            cand_logits[:UNIT_VOCAB_SIZE] = logits[u_start:u_end]
+            cand_logits[UNIT_VOCAB_SIZE] = logits[self.eos_token_id]
+
+            if len(session.recent_unit_ids) >= 8 and len(set(session.recent_unit_ids[-8:])) == 1:
+                pu = session.recent_unit_ids[-1] - u_start
+                if 0 <= pu < UNIT_VOCAB_SIZE:
+                    cand_logits[pu] -= 8.0
+            elif len(session.recent_unit_ids) >= 10 and len(set(session.recent_unit_ids[-10:])) <= 2:
+                for sid in set(session.recent_unit_ids[-10:]):
+                    pu = sid - u_start
+                    if 0 <= pu < UNIT_VOCAB_SIZE:
+                        cand_logits[pu] -= 6.0
+
+            if temperature <= 1e-3:
+                c_idx = int(torch.argmax(cand_logits).item())
             else:
-                # Feed the last unit of a non-final chunk into KV cache before returning
-                _ = self.model(
+                scaled = cand_logits / temperature
+                if top_k > 0:
+                    v, _ = torch.topk(scaled, min(top_k, UNIT_VOCAB_SIZE + 1))
+                    scaled.masked_fill_(scaled < v[-1], float("-inf"))
+                c_idx = int(torch.multinomial(F.softmax(scaled, dim=-1), num_samples=1).item())
+
+            if c_idx == UNIT_VOCAB_SIZE:
+                session.finished = True
+                break
+
+            next_id = c_idx + u_start
+            emitted_units.append(c_idx)
+            session.recent_unit_ids.append(next_id)
+
+            if len(emitted_units) < max_steps:
+                next_t = torch.tensor([[next_id]], dtype=torch.long, device=device)
+                step_out = self.model(
                     inputs_embeds=embed_fn(next_t).to(dtype=dtype),
                     past_key_values=session.kv_cache,
                     use_cache=True,
                     logits_to_keep=1,
                     return_dict=True,
                 )
+                logits = step_out.logits[0, -1, :].float()
 
         return emitted_units
 
