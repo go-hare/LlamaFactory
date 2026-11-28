@@ -721,6 +721,8 @@ class Gemma4SpeechGenerator(nn.Module):
 
         tc_start = gemma_tokenizer.convert_tokens_to_ids("<|tool_call>")
         tc_end = gemma_tokenizer.convert_tokens_to_ids("<tool_call|>")
+        th_start = gemma_tokenizer.convert_tokens_to_ids("<|channel>")
+        th_end = gemma_tokenizer.convert_tokens_to_ids("<channel|>")
         skip_ids = set(gemma_tokenizer.all_special_ids) | set(range(6, 14))
         for tok_s in ("<turn|>", "<|turn>", "<|tool_response>", "<tool_response|>"):
             tid = gemma_tokenizer.convert_tokens_to_ids(tok_s)
@@ -729,10 +731,10 @@ class Gemma4SpeechGenerator(nn.Module):
 
         tid = int(gemma_token_id)
         if not is_turn_end:
-            if tid == tc_start:
+            if tid in (tc_start, th_start):
                 session.in_tool_call = True
                 return []
-            if tid == tc_end:
+            if tid in (tc_end, th_end):
                 session.in_tool_call = False
                 return []
             if session.in_tool_call or tid in skip_ids:
@@ -746,6 +748,9 @@ class Gemma4SpeechGenerator(nn.Module):
             avg_h = torch.stack(session.pending_gemma_hiddens, dim=0).mean(dim=0)
             session.pending_gemma_ids.clear()
             session.pending_gemma_hiddens.clear()
+            piece = piece.replace("*", "").replace("#", "").replace("`", "")
+            if not piece:
+                return []
             session.spoken_char_count += len(piece.strip())
 
             sub_ids = self.tokenizer.encode(piece, add_special_tokens=False)

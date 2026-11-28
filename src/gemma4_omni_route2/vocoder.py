@@ -311,7 +311,10 @@ class Cosy2StreamingVocoder:
         )
         self.mel_cache_len = 8
         self.source_cache_len = int(self.mel_cache_len * 480)
-        self.speech_window = np.hamming(2 * self.source_cache_len)
+        t_ramp = np.linspace(0.0, 0.5 * np.pi, self.source_cache_len, dtype=np.float32)
+        fade_in_w = np.sin(t_ramp) ** 2
+        fade_out_w = np.cos(t_ramp) ** 2
+        self.speech_window = np.concatenate([fade_in_w, fade_out_w], axis=0)
         self.speech_window_t = torch.from_numpy(self.speech_window).float().to(self.device)
         self.lock = threading.Lock()
         self.hift_cache_dict: dict[str, Optional[dict]] = {}
@@ -536,8 +539,8 @@ class Cosy2StreamingVocoder:
             return np.zeros(0, dtype=np.float32)
 
         if not finalize:
-            # With CUDAGraph (~22ms per Read=3 cycle on A100), Chunk 0 fires on Cycle 1 (10 units) for <300ms TTFA!
-            need_units = max(min_chunk_units, 7) if offset == 0 else 14
+            # With CUDAGraph (~22ms per Read=3 cycle on A100), Chunk 0 fires on Cycle 1 (10 units) and every subsequent 10-unit cycle!
+            need_units = max(min_chunk_units, 7) if offset == 0 else 10
             if avail < need_units + self.flow.pre_lookahead_len:
                 return np.zeros(0, dtype=np.float32)
         else:
