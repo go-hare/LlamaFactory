@@ -19,10 +19,12 @@ import re
 import sys
 import threading
 import time
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 os.environ.setdefault("DISABLE_VERSION_CHECK", "1")
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 import numpy as np
 import soundfile as sf
@@ -295,6 +297,7 @@ class Route2OmniEngine:
             input_features_mask=input_features_mask,
             past_key_values=self.cache,
             use_cache=True,
+            logits_to_keep=1,
             return_dict=True,
         )
         self.seq_len += L

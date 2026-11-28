@@ -141,13 +141,13 @@ class SineGen(torch.nn.Module):
         :return: [B, 1, sample_len]
         """
 
-        F_mat = torch.zeros((f0.size(0), self.harmonic_num + 1, f0.size(-1))).to(f0.device)
-        for i in range(self.harmonic_num + 1):
-            F_mat[:, i: i + 1, :] = f0 * (i + 1) / self.sampling_rate
+        harmonics = torch.arange(1, self.harmonic_num + 2, device=f0.device, dtype=f0.dtype).view(1, -1, 1)
+        F_mat = f0 * harmonics / self.sampling_rate
 
         theta_mat = 2 * np.pi * (torch.cumsum(F_mat, dim=-1) % 1)
-        u_dist = Uniform(low=-np.pi, high=np.pi)
-        phase_vec = u_dist.sample(sample_shape=(f0.size(0), self.harmonic_num + 1, 1)).to(F_mat.device)
+        phase_vec = torch.empty(
+            (f0.size(0), self.harmonic_num + 1, 1), device=F_mat.device, dtype=F_mat.dtype
+        ).uniform_(-np.pi, np.pi)
         phase_vec[:, 0, :] = 0
 
         # generate sine waveforms

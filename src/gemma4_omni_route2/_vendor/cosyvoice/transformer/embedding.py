@@ -218,7 +218,7 @@ class EspnetRelPositionalEncoding(torch.nn.Module):
         self.d_model = d_model
         self.xscale = math.sqrt(self.d_model)
         self.dropout = torch.nn.Dropout(p=dropout_rate)
-        self.pe = None
+        self.register_buffer("pe", None, persistent=False)
         self.extend_pe(torch.tensor(0.0).expand(1, max_len))
 
     def extend_pe(self, x: torch.Tensor):

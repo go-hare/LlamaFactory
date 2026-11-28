@@ -30,6 +30,8 @@ DUPLEX_SPECIAL_TOKENS = [f"<unused{i}>" for i in range(8)]
 class StaticGraphCache(Cache):
     """Zero-allocation static KV cache supporting multi-token prefill and 1-token CUDAGraph replay."""
 
+    is_compileable = False
+
     def __init__(self, max_len: int):
         super().__init__(layers=[])
         self.max_len = max_len
@@ -38,8 +40,17 @@ class StaticGraphCache(Cache):
         self.seq_len_int: int = 0
         self.graph_pos: Optional[torch.Tensor] = None
 
+    def __bool__(self) -> bool:
+        return True
+
     def get_seq_length(self, layer_idx: int = 0) -> int:
         return self.seq_len_int
+
+    def get_max_cache_shape(self, layer_idx: Optional[int] = None) -> int:
+        return self.max_len
+
+    def get_mask_sizes(self, query_length: int, layer_idx: int = 0) -> tuple[int, int]:
+        return self.seq_len_int + query_length, 0
 
     def reset(self) -> None:
         self.seq_len_int = 0
@@ -49,7 +60,14 @@ class StaticGraphCache(Cache):
         self.seq_len_int = max(0, min(int(target_len), self.seq_len_int))
         self.graph_pos = None
 
-    def update(self, key_states: torch.Tensor, value_states: torch.Tensor, layer_idx: int, cache_kwargs=None):
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+        *args,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         bsz, n_heads, seq_l, head_d = key_states.shape
         if layer_idx not in self.k_bufs:
             self.k_bufs[layer_idx] = torch.zeros(
